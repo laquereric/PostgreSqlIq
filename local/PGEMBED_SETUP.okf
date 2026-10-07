@@ -1,0 +1,452 @@
+# @use_case Development/UseCase/UC_GherkinIq
+# @facet UseCase3
+format: okf/1.0
+title: pgembed PostgreSQL Setup on Muse VM
+version: 1.0.0
+date: 2026-10-05
+author: Iq Development Team
+
+# PGEMBED SETUP FOR MUSE VMS
+
+## What is pgembed?
+
+**pgembed** is a single database APPLICATION that provides isolated database INSTANCES.
+
+- One pgembed app running on Muse
+- Provides ONE database instance per user
+- Each instance completely isolated from other users
+- Within instance: multiple schemas for multiple apps
+
+## Installation on Muse VM
+
+### Step 1: Install PostgreSQL Development Files
+
+```bash
+# Update package manager
+sudo apt-get update
+
+# Install PostgreSQL (includes pgembed)
+sudo apt-get install -y postgresql-15 libpq-dev postgresql-server-dev-15
+
+# Verify installation
+postgres --version
+```
+
+### Step 2: Initialize pgembed Data Directory
+
+```bash
+# Set up data directory
+mkdir -p /home/hatch/pgembed/data
+chmod 700 /home/hatch/pgembed/data
+
+# Initialize database cluster
+initdb -D /home/hatch/pgembed/data -U postgres
+
+# This creates:
+# - pg_hba.conf (authentication)
+# - postgresql.conf (settings)
+# - base/ subdirectory (system databases)
+```
+
+### Step 3: Configure PostgreSQL
+
+**Edit**: `/home/hatch/pgembed/data/postgresql.conf`
+
+```ini
+# Network Settings
+listen_addresses = 'localhost'        # Only local connections
+port = 5432
+
+# Memory Settings (Muse has 7.7GB total)
+shared_buffers = 512MB                # ~7% of RAM
+effective_cache_size = 2GB            # 25% of RAM
+work_mem = 10MB                       # Per-operation memory
+maintenance_work_mem = 256MB
+
+# Logging
+log_statement = 'all'                 # Log all queries (for debugging)
+log_duration = on
+log_line_prefix = '%t [%p] %u@%d: '
+
+# Connection Pooling
+max_connections = 100
+```
+
+### Step 4: Start pgembed
+
+```bash
+# Start database server
+pg_ctl -D /home/hatch/pgembed/data -l /home/hatch/pgembed/postgres.log start
+
+# Verify it's running
+pg_isready -p 5432
+
+# Check logs
+tail /home/hatch/pgembed/postgres.log
+```
+
+## Database Initialization
+
+### Step 1: Create Main Database
+
+```bash
+# Connect as postgres user
+psql -U postgres -d postgres -p 5432
+
+# Inside psql:
+CREATE DATABASE iq_main;
+\q
+```
+
+### Step 2: Create App-Specific Schemas
+
+```bash
+# Connect to iq_main
+psql -U postgres -d iq_main -p 5432 << 'EOF'
+
+-- Create schemas for each Iq app
+CREATE SCHEMA IF NOT EXISTS iq;
+CREATE SCHEMA IF NOT EXISTS sa;
+CREATE SCHEMA IF NOT EXISTS mm;
+CREATE SCHEMA IF NOT EXISTS fc;
+CREATE SCHEMA IF NOT EXISTS tun;
+
+-- Create roles for each app (for access control)
+CREATE ROLE iq_app WITH NOLOGIN;
+CREATE ROLE sa_app WITH NOLOGIN;
+CREATE ROLE mm_app WITH NOLOGIN;
+CREATE ROLE fc_app WITH NOLOGIN;
+CREATE ROLE tun_app WITH NOLOGIN;
+
+-- Grant schema usage to roles
+GRANT USAGE ON SCHEMA iq TO iq_app;
+GRANT USAGE ON SCHEMA sa TO sa_app;
+GRANT USAGE ON SCHEMA mm TO mm_app;
+GRANT USAGE ON SCHEMA fc TO fc_app;
+GRANT USAGE ON SCHEMA tun TO tun_app;
+
+-- Grant all privileges on tables in each schema
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA iq TO iq_app;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA sa TO sa_app;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA mm TO mm_app;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA fc TO fc_app;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA tun TO tun_app;
+
+-- Verify
+\dn
+\du
+
+EOF
+```
+
+### Step 3: Initialize App Schemas
+
+Each app needs its schema initialized with proper tables:
+
+**IntentionalQuality** (`iq` schema):
+```sql
+psql -U postgres -d iq_main -p 5432 << 'EOF'
+
+-- Create tables in iq schema
+CREATE TABLE IF NOT EXISTS iq.users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS iq.items (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES iq.users(id),
+    title VARCHAR(255) NOT NULL,
+    data JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS iq.logs (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES iq.users(id),
+    action VARCHAR(100),
+    details JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes
+CREATE INDEX idx_iq_users_email ON iq.users(email);
+CREATE INDEX idx_iq_items_user_id ON iq.items(user_id);
+CREATE INDEX idx_iq_logs_user_id ON iq.logs(user_id);
+
+EOF
+```
+
+Repeat for each app (sa, mm, fc, tun) with their specific tables.
+
+## Connection from FastAPI
+
+### Python psycopg2 Connection
+
+```python
+import psycopg2
+from psycopg2 import pool
+from contextlib import contextmanager
+
+# Create connection pool (shared across all apps)
+connection_pool = psycopg2.pool.SimpleConnectionPool(
+    minconn=1,
+    maxconn=20,  # Max concurrent connections
+    dbname='iq_main',
+    host='localhost',
+    port=5432,
+    user='postgres'
+)
+
+@contextmanager
+def get_db(app_name: str):
+    """Get database connection with schema isolation."""
+    conn = connection_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        # Set search_path to app's schema
+        cursor.execute(f'SET search_path TO {app_name}, public')
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+        connection_pool.putconn(conn)
+
+# Usage
+with get_db('iq') as cursor:
+    cursor.execute('SELECT * FROM users')  # Actually queries iq.users
+    rows = cursor.fetchall()
+```
+
+## Schema Isolation Guarantees
+
+### How It Works
+
+1. **FastAPI Handler** receives request: `GET /iq/users`
+2. **Calls**: `get_db('iq')`
+3. **Connection pool** returns connection
+4. **Execute**: `SET search_path TO iq, public`
+5. **Query**: `SELECT * FROM users` → actually queries `iq.users`
+6. **Returns**: only iq.users rows
+7. **App cannot see**: sa.users, mm.users, etc.
+
+### Database-Level Enforcement
+
+```sql
+-- These queries are impossible:
+SELECT * FROM sa.users;      -- Error: no schema access
+SELECT * FROM mm.items;      -- Error: no schema access
+SELECT * FROM iq.sa.users;   -- Error: no such schema
+
+-- These work (within iq schema):
+SELECT * FROM users;         -- iq.users (implicit via search_path)
+SELECT * FROM items;         -- iq.items
+SELECT * FROM iq.users;      -- iq.users (explicit)
+```
+
+## Monitoring pgembed
+
+### Check Status
+
+```bash
+# Is PostgreSQL running?
+pg_isready -p 5432
+
+# Active connections
+psql -U postgres -d iq_main -c "SELECT count(*) FROM pg_stat_activity;"
+
+# Database size
+psql -U postgres -d iq_main -c "SELECT pg_size_pretty(pg_database_size('iq_main'));"
+```
+
+### Performance Monitoring
+
+```bash
+# Top queries
+psql -U postgres -d iq_main -c "SELECT query, calls, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;"
+
+# Connection pool status
+psql -U postgres -d iq_main -c "SELECT * FROM pg_stat_activity;"
+
+# Schema sizes
+psql -U postgres -d iq_main << 'EOF'
+SELECT
+    schema_name,
+    pg_size_pretty(schema_size) AS size
+FROM (
+    SELECT
+        schema_name,
+        pg_total_relation_size(quote_ident(schema_name)||'.'||quote_ident(tablename))::bigint AS schema_size
+    FROM pg_tables
+    GROUP BY schema_name
+) t
+ORDER BY schema_size DESC;
+EOF
+```
+
+## Backup & Restore
+
+### Full Database Backup
+
+```bash
+# Backup entire database (for MotherDuck sync)
+pg_dump -U postgres -d iq_main -F custom -f iq_main.dump
+
+# Backup specific schema only
+pg_dump -U postgres -d iq_main -n iq -F custom -f iq_schema.dump
+
+# Size of backup
+ls -lh iq_main.dump
+```
+
+### Restore from Backup
+
+```bash
+# Create fresh database
+createdb -U postgres iq_main_restore
+
+# Restore from backup
+pg_restore -U postgres -d iq_main_restore iq_main.dump
+
+# Verify
+psql -U postgres -d iq_main_restore -c "\dn"
+```
+
+## Shutdown & Restart
+
+### Graceful Shutdown
+
+```bash
+# Stop PostgreSQL cleanly
+pg_ctl -D /home/hatch/pgembed/data stop -m fast
+
+# Check it stopped
+pg_isready -p 5432  # Should report 'rejecting connections'
+```
+
+### Startup Script
+
+**File**: `/home/hatch/start_postgres.sh`
+
+```bash
+#!/bin/bash
+set -e
+
+PGEMBED_HOME="/home/hatch/pgembed"
+PGEMBED_DATA="${PGEMBED_HOME}/data"
+PGEMBED_LOG="${PGEMBED_HOME}/postgres.log"
+PGEMBED_PORT=5432
+
+# Check if already running
+if pg_isready -p $PGEMBED_PORT &> /dev/null; then
+    echo "✅ PostgreSQL already running on port $PGEMBED_PORT"
+    exit 0
+fi
+
+# Start PostgreSQL
+echo "🚀 Starting PostgreSQL (pgembed)..."
+pg_ctl -D $PGEMBED_DATA \
+  -l $PGEMBED_LOG \
+  -o "-p $PGEMBED_PORT" \
+  start
+
+# Wait for startup
+sleep 2
+
+# Verify
+if pg_isready -p $PGEMBED_PORT &> /dev/null; then
+    echo "✅ PostgreSQL started successfully"
+    echo "   Data: $PGEMBED_DATA"
+    echo "   Logs: $PGEMBED_LOG"
+    echo "   Port: $PGEMBED_PORT"
+else
+    echo "❌ PostgreSQL failed to start"
+    echo "   Check logs: $PGEMBED_LOG"
+    exit 1
+fi
+```
+
+### Enable Auto-Startup
+
+```bash
+# Make script executable
+chmod +x /home/hatch/start_postgres.sh
+
+# Add to systemd (optional)
+sudo tee /etc/systemd/system/postgresql-muse.service > /dev/null <<EOF
+[Unit]
+Description=PostgreSQL for Iq Muse VM
+After=network.target
+
+[Service]
+Type=simple
+User=hatch
+WorkingDirectory=/home/hatch
+ExecStart=/home/hatch/start_postgres.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable
+sudo systemctl daemon-reload
+sudo systemctl enable postgresql-muse
+sudo systemctl start postgresql-muse
+```
+
+## Troubleshooting
+
+### PostgreSQL Won't Start
+
+```bash
+# Check logs
+tail -50 /home/hatch/pgembed/postgres.log
+
+# Common causes:
+# 1. Port already in use
+netstat -tlnp | grep 5432
+
+# 2. Data directory permissions
+ls -la /home/hatch/pgembed/data
+
+# 3. Corrupted data
+pg_resetwal -D /home/hatch/pgembed/data
+```
+
+### Connection Refused
+
+```bash
+# Check if PostgreSQL is running
+pg_isready -p 5432
+
+# Check firewall (on Muse, should be localhost only)
+netstat -tlnp | grep postgres
+
+# Connect directly
+psql -h localhost -p 5432 -U postgres -d postgres
+```
+
+### Out of Memory
+
+```bash
+# Monitor memory
+free -h
+
+# Check PostgreSQL memory usage
+ps aux | grep postgres | grep -v grep
+
+# Reduce shared_buffers in postgresql.conf
+# Restart PostgreSQL
+```
+
+---
+
+**Status**: pgembed setup procedure finalized
+**Next**: FastAPI integration with connection pooling
