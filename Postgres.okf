@@ -1,0 +1,109 @@
+---
+@use_case Development/UseCase/UC_Postgres
+@facet Store
+@status Proposed
+format: okf/1.0
+title: Postgres in IQ -- the store as it is
+version: 0.1.0
+date: 2026-10-16
+part_of: UC_DataPlatform
+---
+
+# Postgres in IQ
+
+## Summary
+
+Postgres is IQ's **durable-store standard**. It runs as pgembed: PostgreSQL 17 bundled inside a Python wheel and
+started by IQ itself, never a Homebrew or system install. Every process finds it through one variable,
+`IQ_REGISTRY_DSN`. It holds IQ's operational truth: the registry, identity, the WebScrape index, the gate's
+decision replay and the ontology cases. It runs today with **no extensions, no roles and no row-level
+security**. Postgres is used, but almost none of its ecosystem is.
+
+## Role in IQ today
+
+| Owner | Tables (DB `iq`, schema `public` unless noted) | Source |
+|---|---|---|
+| Registry / Encounter (UC_IntentionalQuality.Com) | `accounts`, `registrations`, `suggestions` | `Sites/intentional-quality-com/muse/encounter.py:80-83` |
+| Identity / IAM (UC_IdentityAndAccess) | `access_tokens`; `identity_map` (token → `subject_iri`) | `Sites/memory-intentionalquality-com/token_store.py:25`, `identity_store.py:32` |
+| UC_WebScrape | `scrape_docs`, `scrape_builds`, `scrape_aliases` (tsvector + GIN for text) | `UC_WebScrape/index.py:36-52` |
+| Decision Objects / CpCp gate (UC_Wasm3) | `cpcp_operations` (jsonb `decision`, `observation`): durable replay | `DeployIq/crates/cpcp-seam/src/gate.rs:212` |
+| UC_OntologyPipeline | `{schema}.onto_cases`, `{schema}.onto_adoptions` | `grounding_live.py:47-50` |
+
+Readers include the Python services (psycopg), the Rust gate (`postgres` crate) and, once an hour, the MotherDuck
+sweep, which copies the registry and scrape tables up to `iq_main` through DuckDB's postgres scanner
+(`UC_AnalyticStore/md_observe.py:130-184`, `iq-analytic.cron:8`).
+
+## Deployment
+
+| Where | How | DSN |
+|---|---|---|
+| Laptop (IQ.app) | `iq_store()` runs `UC_App/iq-pg.sh` at app start (`src-tauri/src/main.rs:406-422`); the launchd seam sets the same DSN | `postgresql://postgres@/iq?host=~/.iq/pg` |
+| Server (broker/IdP box) | systemd `iq-pg.service` runs `Sites/intentional-quality-com/registry/iq_pg.py` (re-checked every 30 s) | `postgresql://postgres@/iq?host=/var/lib/iq/pg` |
+| Muse VM | `pgembed==0.2.0` installed, no server started | -- |
+
+- **Version**: pgembed 0.2.0, PostgreSQL 17 (`requirements.txt:6`).
+- **Network**: unix socket only, no TCP listener. The socket directory's file permissions are the only access
+  boundary.
+- **Schema changes**: tables are created with `CREATE ... IF NOT EXISTS` in each owner's code. There are no
+  migrations.
+- **Cost**: none beyond the host it runs on.
+
+## Data and IRIs
+
+- **IRI-keyed**: `scrape_docs.iri` (indexed), `scrape_builds.iri` (PK) and `scrape_aliases.iri` ("every row
+  carries its IRI", `index.py:11`); `identity_map.subject_iri`.
+- **Not IRI-keyed**: the registry tables (keyed by email) and `cpcp_operations`, whose IRIs are inside the jsonb
+  rather than in columns.
+- Location is stored as plain `lat`/`lon` doubles. There is no geometry type.
+
+## Medallion tier
+
+**Silver**, the governed operational record, per the UC_SemanticMedallion tier table ("pgembed registries"),
+which also puts pgembed in Gold beside MotherDuck. In practice Postgres is where governed facts are written, and
+MotherDuck receives a copy of them.
+
+## Strengths
+
+- **Already the standard.** Every durable IQ store uses it, with one DSN convention and no fallback to discover.
+- **Embedded and the same on every host**: the same binary and the same DSN form on the laptop and the server.
+  This is UC_LocalRemoteSymmetry in practice.
+- **Transactional and relational**, with jsonb for semi-structured decisions and built-in full-text search.
+- **Open source with the largest extension ecosystem of the four stores** (slice 2).
+
+## Limits
+
+- **No extensions.** pgvector, pgvectorscale, pgtextsearch and pgembed-http exist only as separate wheels that
+  are not on PyPI and not in the image (`requirements.txt:7-8`, `REGISTRY.md:55`). There is no PostGIS.
+- **No tenancy inside the database**: one passwordless `postgres` superuser, no roles and no row-level
+  security. Per-node or per-app instances are designed but not built (`UC_MultiTenancy/DESIGN.md:78,112`).
+- **No point-in-time recovery.** The documented backup is `pg_dump` or a filesystem snapshot
+  (`REGISTRY.md:57-60`); the MotherDuck copy is a partial replica, not a backup.
+- **Residue**: the Encounter registry still falls back to SQLite when no DSN is set, and the SQLite rollback path
+  is still documented (`REGISTRY.md:44`). This conflicts with the no-SQLite rule.
+- **Stale document**: `docs/architecture/PGEMBED_SETUP.okf` describes an apt `postgresql-15` install with an
+  `iq_main` database and the schemas `iq/sa/mm/fc/tun`. Nothing in the code does this.
+
+## Fit for each consumer
+
+| Consumer | Today | Plausible role |
+|---|---|---|
+| UC_ProtegeIq | none (vocabulary decisions go through the gate, which writes `cpcp_operations`) | Grants, decisions and revision index; a graph via AGE (slice 2) |
+| UC_Superset | indirect (through the MotherDuck copy) | Operational dashboards over the source directly, if latency matters |
+| UC_UxLifecycle | none | Journeys and responses as governed Silver rows keyed by IRI |
+| UC_OntologyPipeline | `onto_cases`, `onto_adoptions` | Cases plus embeddings (pgvector) for grounding |
+
+## Open questions
+
+1. Bring the extension wheels (pgvector first) into `UC_App/python-image.txt`, or build them? This gates most of
+   slice 2's "configured" column.
+2. Tenancy: roles plus row-level security in one database, or one pgembed instance per node as designed?
+3. Remove the SQLite fallback in `encounter.py` now that everything is on Postgres?
+4. Retire or rewrite `docs/architecture/PGEMBED_SETUP.okf`?
+
+## Sources
+
+- `Development/UseCase/UC_App/iq-pg.sh`, `UC_App/DESIGN.md:627-636`, `UC_App/app/src-tauri/src/main.rs:406-422`
+- `Development/UseCase/UC_IntentionalQuality.Com/REGISTRY.md`
+- `Development/UseCase/UC_WebScrape/index.py`, `DeployIq/crates/cpcp-seam/src/gate.rs`
+- `Development/UseCase/UC_MultiTenancy/DESIGN.md`, `Development/UseCase/UC_AnalyticStore/md_observe.py`
+- `GherkinIq/Facet/Store/README.md:264`, `requirements.txt`
