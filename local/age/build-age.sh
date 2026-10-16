@@ -22,7 +22,8 @@ DEV="${IQ_DEV_DIR:-$HOME/.iq/dev}"
 PGC="$("$PY" -c 'import os, pgembed; print(os.path.join(os.path.dirname(pgembed.__file__), "pginstall", "bin", "pg_config"))')"
 [ -x "$PGC" ] || { echo "[build-age] no pgembed pg_config under $PY" >&2; exit 1; }
 EXT="$("$PGC" --sharedir)/extension"
-if [ -f "$EXT/age--${AGE_VER}.sql" ] && ls "$("$PGC" --pkglibdir)"/age.{dylib,so} >/dev/null 2>&1; then
+LIB="$("$PGC" --pkglibdir)"
+if [ -f "$EXT/age--${AGE_VER}.sql" ] && { [ -f "$LIB/age.dylib" ] || [ -f "$LIB/age.so" ]; }; then
   exit 0
 fi
 
@@ -44,6 +45,8 @@ tar -xzf "$TMP/age.tar.gz" -C "$TMP"
 # pgembed's PGXS remembers its CI machine: the macOS SDK path (PG_SYSROOT) and a Homebrew perl. Point both here.
 MK=(PG_CONFIG="$PGC" BISON="$BISON" PERL=/usr/bin/perl)
 [ "$(uname)" = "Darwin" ] && MK+=(PG_SYSROOT="$(xcrun --show-sdk-path)")
-(cd "$TMP/apache-age-${AGE_VER}" && make "${MK[@]}" -j8 && make "${MK[@]}" install) >"$TMP/age.log" 2>&1 \
+# a caller's MACOSX_DEPLOYMENT_TARGET (cargo/tauri set an old one for build.rs) would make AGE's -Werror reject
+# preadv/pwritev in PostgreSQL's own headers; the server this links into targets this machine's macOS anyway
+(cd "$TMP/apache-age-${AGE_VER}" && unset MACOSX_DEPLOYMENT_TARGET && make "${MK[@]}" -j8 && make "${MK[@]}" install) >"$TMP/age.log" 2>&1 \
   || { grep -E "error|Error" "$TMP/age.log" | tail -20 >&2; exit 1; }
 echo "[build-age] AGE ${AGE_VER} installed into $(dirname "$(dirname "$PGC")")" >&2
