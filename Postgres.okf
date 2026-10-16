@@ -3,8 +3,8 @@
 @facet Store
 @status Proposed
 format: okf/1.0
-title: Postgres in IQ -- the store as it is
-version: 0.1.0
+title: Postgres in IQ -- the store as it is and as configured
+version: 0.2.0
 date: 2026-10-16
 part_of: UC_DataPlatform
 ---
@@ -16,8 +16,9 @@ part_of: UC_DataPlatform
 Postgres is IQ's **durable-store standard**. It runs as pgembed: PostgreSQL 17 bundled inside a Python wheel and
 started by IQ itself, never a Homebrew or system install. Every process finds it through one variable,
 `IQ_REGISTRY_DSN`. It holds IQ's operational truth: the registry, identity, the WebScrape index, the gate's
-decision replay and the ontology cases. It runs today with **no extensions, no roles and no row-level
-security**. Postgres is used, but almost none of its ecosystem is.
+decision replay and the ontology cases. It runs today with **no extension created, no roles and no row-level
+security**, although the bundled build already ships pgvector, pgvectorscale, pg_duckdb, pg_search and
+pg_textsearch (see Ecosystem). Postgres is used, but almost none of its ecosystem is.
 
 ## Role in IQ today
 
@@ -72,8 +73,11 @@ MotherDuck receives a copy of them.
 
 ## Limits
 
-- **No extensions.** pgvector, pgvectorscale, pgtextsearch and pgembed-http exist only as separate wheels that
-  are not on PyPI and not in the image (`requirements.txt:7-8`, `REGISTRY.md:55`). There is no PostGIS.
+- **No extension created.** The installed pgembed build (PostgreSQL 17.9) ships `vector` 0.8.2, `vectorscale`
+  0.9.0, `pg_duckdb` 1.1.0, `pg_search` 0.21.14 and `pg_textsearch` 0.6.1 (`pg_available_extensions` in the live
+  `iq` database, 2026-10-16), but `installed_version` is empty for every one and `shared_preload_libraries` is
+  empty. The notes saying these are separate wheels missing from the image (`requirements.txt:7-8`,
+  `REGISTRY.md:55`) are out of date for this image. There is no PostGIS and no AGE.
 - **No tenancy inside the database**: one passwordless `postgres` superuser, no roles and no row-level
   security. Per-node or per-app instances are designed but not built (`UC_MultiTenancy/DESIGN.md:78,112`).
 - **No point-in-time recovery.** The documented backup is `pg_dump` or a filesystem snapshot
@@ -92,10 +96,61 @@ MotherDuck receives a copy of them.
 | UC_UxLifecycle | none | Journeys and responses as governed Silver rows keyed by IRI |
 | UC_OntologyPipeline | `onto_cases`, `onto_adoptions` | Cases plus embeddings (pgvector) for grounding |
 
+## Ecosystem: base vs configured
+
+*Slice 2. "Shipped" means the extension is in IQ's pgembed build but `CREATE EXTENSION` has not been run. "Add"
+means it would have to be built into the image. Upstream status as of 2026-10; the sources are listed at the end.*
+
+| Capability | Extension | In IQ | What it adds | Serves |
+|---|---|---|---|---|
+| Vectors / ANN | pgvector 0.8.2 (upstream 0.8.7), PostgreSQL license | **shipped** | `vector`/`halfvec`/`sparsevec`, HNSW and IVFFlat | OntologyPipeline (grounding), WebScrape |
+| ANN at scale | pgvectorscale 0.9.0, PostgreSQL license | **shipped** | StreamingDiskANN, statistical binary quantization, label-filtered search | OntologyPipeline |
+| BM25 text | pg_search 0.21.14 (ParadeDB), **AGPL-3.0** | **shipped** | Tantivy BM25; hybrid ranking with vectors | WebScrape, ProtegeIq (label search) |
+| BM25 text | pg_textsearch 0.6.1 | **shipped** | BM25 (the Timescale one) | same: keep one of the two |
+| OLAP in Postgres | pg_duckdb 1.1.0, MIT | **shipped**, needs `shared_preload_libraries` | DuckDB engine in Postgres; Parquet/Iceberg/Delta on S3; `duckdb.enable_motherduck()` | Superset, UxLifecycle |
+| Property graph | Apache AGE 1.7 (PG17 build), Apache-2.0 | add | openCypher over Postgres tables | ProtegeIq, OntologyPipeline |
+| Spatial | PostGIS 3.6, GPL-2.0 | add | geometry/geography types, GiST spatial indexes | Streetmap, GeoLocation, WebScrape `lat`/`lon` |
+| Iceberg | pg_lake (Snowflake-Labs), Apache-2.0; PG17 not confirmed | add | Postgres as Iceberg catalog; COPY/query Parquet on object storage through a DuckDB sidecar | Superset, UxLifecycle |
+| Scheduling | pg_cron 1.6 | add | cron inside the database | replaces `iq-analytic.cron` sweeps |
+| Audit | pgaudit 17.x | add | session and object audit log | IdentityAndAccess |
+| Shape checks | pg_jsonschema (Supabase), Apache-2.0 | add | JSON Schema `CHECK` on jsonb | `cpcp_operations` against LinkML-generated JSON Schema |
+| Incremental views | pg_ivm 1.16 | add | materialized views maintained incrementally | UxLifecycle funnels |
+| Time series | TimescaleDB 2.30 (TSL-licensed parts) | add | hypertables, compression, continuous aggregates | UxLifecycle events, `cognitive_invocations` |
+| Core, unused | row-level security, roles, logical replication, LISTEN/NOTIFY | core | tenancy in the store; change capture for incremental Gold | MultiTenancy, AnalyticStore |
+
+No extension is needed for **DuckLake**: DuckDB keeps the DuckLake catalog in an ordinary Postgres database, so
+pgembed can serve as the catalog as it is (see `../UC_Motherduck/Motherduck.okf`).
+
+### What configuring it changes
+
+- **Retrieval in the store.** pgvector plus pg_search give hybrid vector + BM25 ranking next to the governed
+  rows, with no separate search engine. Grounding and WebScrape search could share one index.
+- **Analytics over Blob without a copy.** pg_duckdb lets Postgres read Parquet on `iq-blobs` directly, which
+  overlaps MotherDuck for small and medium data.
+- **A graph, but not RDF.** AGE adds a property graph (openCypher). It does not add SPARQL or RDF, which IQ already
+  gets from Oxigraph (`../UC_Oxigraph/Oxigraph.okf`). Inference over triples is in neither, and only MarkLogic
+  has it (slice 3).
+- **Tenancy and audit inside the store**: row-level security plus roles keyed to `iq:identity:` subjects, and
+  pgaudit, replace "the socket directory is the boundary".
+- **Incremental flows**: logical replication or pg_ivm instead of the sweep's full `CREATE OR REPLACE` rebuilds.
+
+### A configured profile (proposal; slice 3 decides)
+
+1. **No build needed**: `CREATE EXTENSION vector, vectorscale, pg_search`; add `pg_duckdb` to
+   `shared_preload_libraries` (one restart through `iq-pg.sh`) and create it. Laptop and server images must ship
+   the same pgembed build.
+2. **Needs a build**: PostGIS and AGE as pgembed companion wheels or our own builds into the image python, never
+   Homebrew. Ask before starting.
+3. **Core settings**: roles plus row-level security, mapped to the identity model.
+
+**License note**: pg_search is AGPL-3.0, and IQ.app bundles the image python that ships it. Running it as an
+internal service is fine. Distributing the app with it inside may bring AGPL obligations, which should be
+checked before IQ.app is distributed. pg_textsearch is the alternative.
+
 ## Open questions
 
-1. Bring the extension wheels (pgvector first) into `UC_App/python-image.txt`, or build them? This gates most of
-   slice 2's "configured" column.
+1. Which shipped extensions to `CREATE` first, and whether to set `shared_preload_libraries` for pg_duckdb (see
+   the configured profile below). The server box's image must ship the same build.
 2. Tenancy: roles plus row-level security in one database, or one pgembed instance per node as designed?
 3. Remove the SQLite fallback in `encounter.py` now that everything is on Postgres?
 4. Retire or rewrite `docs/architecture/PGEMBED_SETUP.okf`?
@@ -107,3 +162,4 @@ MotherDuck receives a copy of them.
 - `Development/UseCase/UC_WebScrape/index.py`, `DeployIq/crates/cpcp-seam/src/gate.rs`
 - `Development/UseCase/UC_MultiTenancy/DESIGN.md`, `Development/UseCase/UC_AnalyticStore/md_observe.py`
 - `GherkinIq/Facet/Store/README.md:264`, `requirements.txt`
+- Ecosystem (2026-10): `pg_available_extensions` in the live `iq` database; github.com/pgvector/pgvector, timescale/pgvectorscale, apache/age, duckdb/pg_duckdb, Snowflake-Labs/pg_lake, paradedb/paradedb, citusdata/pg_cron, pgaudit/pgaudit, supabase/pg_jsonschema, sraoss/pg_ivm, timescale/timescaledb; postgis.net/news; pypi.org/project/pgembed
