@@ -205,3 +205,58 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     When note 41 is inserted
     And the streamer runs one cycle
     Then the Agents tab's cdc value has the slot, the health and the last cycle
+
+  Scenario: A row filter on the key ships only the rows it matches
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When the filter on public.notes is "id < 100"
+    Then the filter is set, and the publication names its tables instead of schema public
+    When note 5 is inserted
+    And note 500 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+    And the shipped insert is note 5
+
+  Scenario: An update moving a row out of the filter ships as a delete, and back in as an insert
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When the filter on public.notes is "body <> 'secret'" with a full replica identity
+    And note 8 is inserted
+    And note 8's body becomes "secret"
+    And note 8's body becomes "public again"
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:delete
+    And the server holds 2 records of op cdc:insert
+    And the shipped delete carries the whole old row of note 8
+
+  Scenario: A filter that would break the table's writers is refused, and nothing changes
+    Given CDC is set up on a fresh notes table
+    When the filter on public.notes is "body <> 'secret'"
+    Then the filter is refused naming the replica identity
+    And the publication still covers schema public with no filters
+    And note 1 can still be inserted, updated and deleted
+
+  Scenario: An expression Postgres will not filter on is refused
+    Given CDC is set up on a fresh notes table
+    When the filter on public.notes is "id < random() * 10"
+    Then the filter is refused
+    And the publication still covers schema public with no filters
+
+  Scenario: The snapshot ships only the rows the filter matches
+    Given a notes table holding 4 notes before CDC is set up
+    And the IQ Server is up
+    When the filter on public.notes is "id >= 3"
+    And the snapshot runs
+    Then it is done with 2 rows of public.notes
+    And the server holds 2 records of op cdc:snapshot
+
+  Scenario: Clearing a filter ships every row again; reset returns to schema public
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When the filter on public.notes is "id < 100"
+    And the filter on public.notes is cleared
+    And note 600 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+    When the filters are reset
+    Then the publication still covers schema public with no filters

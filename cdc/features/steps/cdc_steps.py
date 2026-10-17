@@ -541,3 +541,73 @@ def _agents_tab(context):
     want = _lag(context)
     assert got["health"] == want["health"] == "ok", got
     assert got["slot"]["confirmed"] == want["slot"]["confirmed"] and got["last_cycle"]["sent"] == 1, got
+
+
+# -- row filters -------------------------------------------------------------------------------------------
+@when('the filter on {table} is "{where}" with a full replica identity')
+def _filter_full(context, table, where):
+    context.filtered = cdc.set_filter(context.dsn, table, where, full=True)
+    assert context.filtered["ok"], context.filtered
+
+
+@when('the filter on {table} is "{where}"')
+def _filter(context, table, where):
+    context.filtered = cdc.set_filter(context.dsn, table, where)
+
+
+@when("the filter on {table} is cleared")
+def _filter_clear(context, table):
+    context.filtered = cdc.set_filter(context.dsn, table, None)
+    assert context.filtered["ok"] and not context.filtered["filters"], context.filtered
+
+
+@when("the filters are reset")
+def _filter_reset(context):
+    assert cdc.reset_filters(context.dsn)["ok"]
+
+
+@then("the filter is set, and the publication names its tables instead of schema public")
+def _filter_set(context):
+    f = context.filtered
+    assert f["ok"] and f["filters"] == {"public.notes": "(id < 100)"} and f["schemas"] == [], f
+    assert cdc.lag(context.dsn, context.state)["filters"] == {"public.notes": "(id < 100)"}
+
+
+@then("the shipped insert is note {n:d}")
+def _shipped_note(context, n):
+    assert [r["new"]["id"] for r in _of_op(context, "cdc:insert")] == [n]
+
+
+@when('note {n:d}\'s body becomes "{body}"')
+def _body(context, n, body):
+    _sql(context, "UPDATE notes SET body = %s WHERE id = %s", (body, n))
+
+
+@then("the shipped delete carries the whole old row of note {n:d}")
+def _whole_old(context, n):
+    d = _of_op(context, "cdc:delete")[0]
+    assert d["old"]["id"] == n and d["old"]["body"] == "note", d
+
+
+@then("the filter is refused naming the replica identity")
+def _refused_ri(context):
+    f = context.filtered
+    assert not f["ok"] and f["reason"] == "refused" and "replica identity" in (f["detail"] + f["hint"]).lower(), f
+
+
+@then("the filter is refused")
+def _refused(context):
+    assert not context.filtered["ok"] and context.filtered["reason"] == "refused", context.filtered
+
+
+@then("the publication still covers schema public with no filters")
+def _still_schema(context):
+    pub = cdc.status(context.dsn)["publication"]
+    assert pub["schemas"] == ["public"] and pub["filters"] == {}, pub
+
+
+@then("note {n:d} can still be inserted, updated and deleted")
+def _writers_ok(context, n):
+    _sql(context, "INSERT INTO notes (id, body) VALUES (%s, 'w')", (n,))
+    _sql(context, "UPDATE notes SET body = 'w2' WHERE id = %s", (n,))
+    _sql(context, "DELETE FROM notes WHERE id = %s", (n,))

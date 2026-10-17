@@ -35,6 +35,11 @@ From then on the streamer advances over any transaction visible in that snapshot
 before the snapshot, so already in the rows -- and ships the rest: nothing twice, nothing missed. While a
 snapshot is incomplete the streamer pauses; re-running it ships only what the server lacks.
 
+**Only some rows.** `iq-cdc.sh filter <table> "<where>"` sets a publication row filter. An update that moves a
+row out of the filter ships as a delete, and one that moves it in ships as an insert (Postgres's own rewrite). The
+snapshot applies the same filter. A filter Postgres would let break the table's writers (a column outside the
+replica identity) is refused before it lands, unless `--full`.
+
 **Who never leaves the box.** Records cross the same de-identification the bridge's Flusher applies (`subject`
 dropped, `subject_iri` and any `iq:identity:` value tokenized by the IdentityMap); in addition any e-mail address
 in a captured value becomes the token of its identity, since a table row is not a log and may hold one anywhere.
@@ -268,7 +273,7 @@ def status(d: str) -> dict:
         cap = c.execute("show max_slot_wal_keep_size").fetchone()[0]
         pub = c.execute("select puballtables, (select array_agg(n.nspname) from pg_publication_namespace pn "
                         "join pg_namespace n on n.oid=pn.pnnspid where pn.pnpubid=p.oid), "
-                        "(select array_agg(schemaname||'.'||tablename) from pg_publication_tables t "
+                        "(select json_object_agg(schemaname||'.'||tablename, rowfilter) from pg_publication_tables t "
                         "where t.pubname=p.pubname) from pg_publication p where pubname=%s",
                         (PUBLICATION,)).fetchone()
         s = c.execute("select active, confirmed_flush_lsn::text, wal_status, "
@@ -277,7 +282,9 @@ def status(d: str) -> dict:
                       "from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone()
     out = {"wal_level": level, "wal_cap": cap, "publication": None, "slot": None}
     if pub:
-        out["publication"] = {"schemas": pub[1] or [], "tables": pub[2] or []}
+        tf = pub[2] or {}
+        out["publication"] = {"schemas": pub[1] or [], "tables": sorted(tf),
+                              "filters": {t: f for t, f in sorted(tf.items()) if f}}
     if s:
         out["slot"] = {"active": s[0], "confirmed": s[1], "wal_status": s[2], "retained_bytes": s[3],
                        "behind_bytes": s[4], "safe_wal_bytes": s[5]}
@@ -453,6 +460,59 @@ def missing(transport, flat):
     return [(e, r) for (e, r), k in zip(flat, keys) if k not in have], sum(k in have for k in keys)
 
 
+# -- row filters ------------------------------------------------------------------------------------------
+def set_filter(d: str, table: str, where: str = None, *, full: bool = False) -> dict:
+    """Capture only the rows of `table` matching `where` (a publication row filter, Postgres 15+); `where=None`
+    clears it. A filter needs the table named in the publication, so a schema-wide publication becomes the list of
+    the tables it covers now (new tables are then not captured until `reset_filters`). Postgres refuses UPDATE and
+    DELETE on a table whose filter names a column outside its replica identity -- so every change is proved in its
+    own transaction (a zero-row UPDATE and DELETE, which Postgres checks before touching a row) and rolled back if
+    refused: a filter never breaks a writer. `full` sets REPLICA IDENTITY FULL first, which allows any column (and
+    makes an update or delete carry the whole old row)."""
+    import psycopg
+    table = _qualified(d, table)
+    with psycopg.connect(d) as c:               # one transaction: the change and its proof, or neither
+        try:
+            rows = c.execute("select schemaname||'.'||tablename, rowfilter from pg_publication_tables "
+                             "where pubname=%s", (PUBLICATION,)).fetchall()
+            if not rows and not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
+                return {"ok": False, "reason": "no_publication", "detail": "run: iq-cdc.sh setup"}
+            filters = dict(rows)
+            filters[table] = where
+            if full:
+                c.execute("ALTER TABLE %s REPLICA IDENTITY FULL" % _ident(table))
+            c.execute("ALTER PUBLICATION %s SET TABLE %s" % (PUBLICATION, ", ".join(
+                _ident(t) + (" WHERE (%s)" % f if f else "") for t, f in sorted(filters.items()))))
+            col = c.execute("select attname from pg_attribute where attrelid=%s::regclass and attnum > 0 "
+                            "and not attisdropped order by attnum limit 1", (_ident(table),)).fetchone()[0]
+            c.execute("UPDATE %s SET %s = %s WHERE false" % (_ident(table), _ident(col), _ident(col)))
+            c.execute("DELETE FROM %s WHERE false" % _ident(table))
+        except psycopg.Error as e:
+            c.rollback()
+            return {"ok": False, "reason": "refused", "table": table,
+                    "detail": (e.diag.message_primary or str(e)).strip(),
+                    "hint": (e.diag.message_detail or e.diag.message_hint or "")}
+    pub = status(d)["publication"]
+    return {"ok": True, "table": table, "where": where, "filters": pub["filters"], "tables": pub["tables"],
+            "schemas": pub["schemas"]}
+
+
+def reset_filters(d: str, schema: str = "public") -> dict:
+    """Back to setup's default: every table in `schema`, no filters (a table's REPLICA IDENTITY is left as set)."""
+    with _connect(d) as c:
+        c.execute("ALTER PUBLICATION %s SET TABLES IN SCHEMA %s" % (PUBLICATION, _ident(schema)))
+    pub = status(d)["publication"]
+    return {"ok": True, "schemas": pub["schemas"], "tables": pub["tables"], "filters": pub["filters"]}
+
+
+def _qualified(d: str, table: str) -> str:
+    """schema.table as the catalog names it (a bare name resolves on the search path)."""
+    with _connect(d) as c:
+        return c.execute("select n.nspname||'.'||c.relname from pg_class c join pg_namespace n "
+                         "on n.oid = c.relnamespace where c.oid = %s::regclass",
+                         (_ident(table) if "." in table else '"%s"' % table,)).fetchone()[0]
+
+
 # -- the lag ----------------------------------------------------------------------------------------------
 def _bytes(cap: str):
     """max_slot_wal_keep_size as bytes ('1GB', '512MB', '-1' -> None)."""
@@ -474,6 +534,8 @@ def lag(d: str, state: str = "") -> dict:
     cap = _bytes(st["wal_cap"])
     out = {"slot": st["slot"], "wal_level": st["wal_level"], "wal_cap": st["wal_cap"], "cap_bytes": cap,
            "tables": (st["publication"] or {}).get("tables", []),
+           "filters": (st["publication"] or {}).get("filters", {}),
+           "schemas": (st["publication"] or {}).get("schemas", []),
            "snapshot": {k: v for k, v in snap.items() if k != "tables"} or None, "last_cycle": last or None}
     s = st["slot"]
     age = None
@@ -572,10 +634,10 @@ def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: i
                                        "now()").fetchone()
         snap = {"snapshot": snap_text, "lsn": lsn,
                 "at": at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
-        tables = c.execute("select schemaname, tablename from pg_publication_tables where pubname=%s "
+        tables = c.execute("select schemaname, tablename, rowfilter from pg_publication_tables where pubname=%s "
                            "order by 1, 2", (PUBLICATION,)).fetchall()
         try:
-            for schema, name in tables:
+            for schema, name, rowfilter in tables:
                 table = "%s.%s" % (schema, name)
                 cols = c.execute("select attname, atttypid from pg_attribute where attrelid=%s::regclass "
                                  "and attnum > 0 and not attisdropped order by attnum",
@@ -583,7 +645,8 @@ def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: i
                 sel = ", ".join("%s::text" % _ident(n) for n, _ in cols)
                 n = 0
                 with c.cursor(name="iq_cdc_snapshot") as cur:
-                    cur.execute("SELECT %s FROM %s" % (sel, _ident(table)))
+                    cur.execute("SELECT %s FROM %s%s" % (sel, _ident(table),
+                                                         " WHERE " + rowfilter if rowfilter else ""))
                     while True:
                         rows = cur.fetchmany(fetch)
                         if not rows:
@@ -662,6 +725,12 @@ def main(argv=None) -> int:
     sub.add_parser("status")
     sub.add_parser("teardown")
     sub.add_parser("snapshot", help="ship the rows that existed before the slot (drains the slot first)")
+    f = sub.add_parser("filter", help="capture only matching rows of a table (publication row filter)")
+    f.add_argument("table", nargs="?", help="schema.table (none: list the filters)")
+    f.add_argument("where", nargs="?", help="a row filter expression, e.g. \"realm = 'root'\"")
+    f.add_argument("--clear", action="store_true", help="capture every row of the table again")
+    f.add_argument("--full", action="store_true", help="REPLICA IDENTITY FULL, so the filter may name any column")
+    f.add_argument("--reset", action="store_true", help="back to every table in public, no filters")
     for name in ("once", "run"):
         r = sub.add_parser(name)
         r.add_argument("--interval", type=float, default=10.0)
@@ -670,6 +739,20 @@ def main(argv=None) -> int:
     if a.cmd == "setup":
         res = setup(d, a.tables, restart_cmd=(lambda: restart(os.path.expanduser(os.environ.get("IQ_PGDATA", "~/.iq/pg"))))
                     if a.restart else None)
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    if a.cmd == "filter":
+        if a.reset:
+            res = reset_filters(d)
+        elif not a.table:
+            pub = status(d)["publication"] or {}
+            res = {"ok": True, "schemas": pub.get("schemas", []), "tables": pub.get("tables", []),
+                   "filters": pub.get("filters", {})}
+        elif a.clear == bool(a.where):
+            print("[iq-cdc] give a WHERE expression or --clear")
+            return 2
+        else:
+            res = set_filter(d, a.table, None if a.clear else a.where, full=a.full)
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
     if a.cmd == "teardown":

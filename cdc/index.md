@@ -61,6 +61,22 @@ Kafka" at Sequin, but IQ already has the destination: the [[UC_LaptopCloudBridge
   The Dashboard's Agents tab shows it as a `cdc` leaf beside the cost meter (green when ok, red when it needs a
   hand), with a detail panel (`UC_Dashboard/tabs/agents`: `cdc_lag()`, loaded under its own module name).
   `iq-cdc.sh status` prints the same health.
+- **Only some rows (slice 4).** `iq-cdc.sh filter <table> "<where>"` sets a publication row filter. `--clear`
+  removes it, `--reset` goes back to every table in `public`, and with no arguments it lists the filters.
+  - **Named tables.** Postgres attaches a filter only to a table named in the publication, and filters across
+    publications are OR'ed. So the first filter turns `iq_cdc` from "every table in `public`" into the tables it
+    covers now. A new table is then not captured until `--reset`, and the Dashboard panel says so.
+  - **Rows crossing the filter.** An update that moves a row out of the filter ships as a delete, and one that
+    moves it back in ships as an insert. This is Postgres's own rewrite.
+  - **The snapshot applies the same filter.**
+  - **A filter never breaks a writer.** Postgres refuses every UPDATE and DELETE on a table whose filter names a
+    column outside the replica identity, and the refusal comes at write time, so a live writer would break. Each
+    change is therefore proved in its own transaction: the publication change plus a zero-row UPDATE and DELETE,
+    which Postgres checks before touching any row. If refused, it is rolled back with Postgres's message.
+    `--full` sets `REPLICA IDENTITY FULL` to allow any column (and makes a delete carry the whole old row). An
+    expression Postgres will not filter on (`random()`, for example) is refused the same way.
+
+  Not applied live: the box's publication is still every table in `public`.
 - **Never autostarted.** There is no launchd job and no app hook. A scenario checks that nothing under UC_App,
   DeployIq, scripts or any plist names it.
 
@@ -99,8 +115,8 @@ rows), and finished (`2444:2444:` at 0/20643A8).
 - After `pg_ctl restart`, pgembed's handle no longer knows the postmaster, so its cleanup leaves it running. The
   scenarios stop it by its data directory.
 
-`features/cdc.feature`: 29 scenarios, all passing in about 2 s (12 for the stream, 7 for the snapshot plus 8
-xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value), on a scratch pgembed cluster with the relay
+`features/cdc.feature`: 35 scenarios, all passing in about 2.5 s (12 for the stream, 7 for the snapshot plus 8
+xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value, 6 for row filters), on a scratch pgembed cluster with the relay
 in-process (nothing reaches the IQ Server):
 
     /Applications/IQ.app/Contents/Resources/python/bin/python3 -m behave features
@@ -111,4 +127,4 @@ scratch dashboard on :8031, then back to :8030).
 
 **Limits.** In a table with no primary key, identical rows have the same content and so one snapshot record.
 
-**Next.** A table filter by publication row filter rather than whole tables.
+**Next.** Column lists (publish only some columns of a table), the other half of what a publication can narrow.
