@@ -60,6 +60,7 @@ ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS raw text;
 ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS media_type text;
 ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS derived_from text[] NOT NULL DEFAULT '{}';
 ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS recorded text;
+ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS operation text;   -- the gate's operation that admitted the write (slice 5)
 ALTER TABLE iq.quad ADD COLUMN IF NOT EXISTS ng text NOT NULL DEFAULT '';
 ALTER TABLE iq.quad ADD COLUMN IF NOT EXISTS lang text;
 CREATE INDEX IF NOT EXISTS quad_ng ON iq.quad (ng);

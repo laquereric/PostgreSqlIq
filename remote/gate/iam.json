@@ -1,0 +1,23 @@
+{
+  "@use_case": "Development/UseCase/UC_Citus",
+  "@facet": "Agent",
+  "policies": [
+    {
+      "name": "citus-plane-writer",
+      "statements": [
+        {"effect": "allow", "actions": ["mcp:call:dataplane:get:*", "mcp:call:dataplane:query:sparql"]},
+        {"effect": "allow", "actions": ["mcp:call:dataplane:put:onto", "mcp:call:dataplane:put:blob"]}
+      ]
+    },
+    {
+      "name": "no-ux-writes",
+      "statements": [
+        {"effect": "deny", "actions": ["mcp:call:dataplane:put:ux"]}
+      ]
+    }
+  ],
+  "attachments": [
+    ["claude-agent@iq.demo", "citus-plane-writer"],
+    ["root", "no-ux-writes"]
+  ]
+}

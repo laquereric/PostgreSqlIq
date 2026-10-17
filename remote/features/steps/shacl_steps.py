@@ -204,16 +204,17 @@ def step_extractor(context):
     assert n == 1
 
 
-def as_agent(context):
-    c = context.cluster.connect()
+def as_role(context, role):
+    c = context.cluster.connect(role=role) if role != "iq_agent" else context.cluster.connect()
     context.open_conns = getattr(context, "open_conns", []) + [c]
-    c.execute("SET ROLE iq_agent")
+    if role == "iq_agent":
+        c.execute("SET ROLE iq_agent")
     return c
 
 
 @then("as the agent role a triple written straight into the record is denied")
 def step_agent_raw(context):
-    c = as_agent(context)
+    c = as_role(context, "iq_agent")
     try:
         c.execute("INSERT INTO iq.quad (g, s, p, o) VALUES (%s, %s, %s, %s)", (iri("test:raw"), iri("test:raw"), A, STORE + "Claim"))
         raise AssertionError("the agent wrote around the shapes")
@@ -221,9 +222,20 @@ def step_agent_raw(context):
         c.rollback()
 
 
-@then("as the agent role a Claim with no subject_iri is refused by the shapes")
-def step_agent_bad(context):
-    c = as_agent(context)
+@then("as the agent role the governed write itself is denied")
+def step_agent_put(context):
+    c = as_role(context, "iq_agent")
+    i, quads = claim("test:agent-try")
+    try:
+        cp.put(c, i, quads, body={"iri": i})
+        raise AssertionError("the agent called the governed write")
+    except psycopg.errors.InsufficientPrivilege:
+        c.rollback()
+
+
+@then("as the gate's writer a Claim with no subject_iri is refused by the shapes")
+def step_gate_bad(context):
+    c = as_role(context, "iq_gate")
     i, quads = claim("test:agent-bad", drop=("subject_iri",))
     cp.put(c, i, quads, body={"iri": i})
     try:
@@ -233,9 +245,9 @@ def step_agent_bad(context):
         c.rollback()
 
 
-@then('as the agent role a Claim "{name}" with every required property commits')
-def step_agent_ok(context, name):
-    c = as_agent(context)
+@then('as the gate\'s writer a Claim "{name}" with every required property commits')
+def step_gate_ok(context, name):
+    c = as_role(context, "iq_gate")
     i, quads = claim(name)
     cp.put(c, i, quads, body={"iri": i})
     c.commit()

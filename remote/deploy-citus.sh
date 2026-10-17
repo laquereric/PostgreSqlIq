@@ -9,6 +9,11 @@
 #   ./deploy-citus.sh hosts-up    # slice 2: a VPC and four instances -- coordinator, w1, w2 and a spare w3 --
 #                                 # one node each, the nodes talking over the VPC's private addresses only
 #   ./deploy-citus.sh hosts-down  # destroy the four and the VPC
+#   ./deploy-citus.sh hosts-park  # stop every node cleanly, snapshot the four, destroy them (a snapshot bills by size,
+#                                 # an instance by the hour); hosts-restore brings them back on the same VPC, each
+#                                 # node renamed in Citus to the private address it was given
+#   ./deploy-citus.sh autopark    # park the hosts cluster after IDLE_SECS (7200) with no client session
+#                                 # (service/install-autopark.sh runs it every 15 min from launchd)
 #   ./deploy-citus.sh lake-build  # pg_lake for PG17/el9, built on a throwaway vc2-6c-16gb (iq-citus-build), packed into
 #                                 # ~/.iq/citus/pg_lake-<tag>-pg17-el9.tar.gz; the box is destroyed after
 #   ./deploy-citus.sh lake-up     # the cold tier on the coordinator: that build, pgduck_server, and Vultr Object
@@ -16,6 +21,8 @@
 #   ./deploy-citus.sh lake-vultr  # the cold tier moved onto Vultr Object Storage (the subscription holding iq-blobs),
 #                                 # in its own bucket iq-lake; the key goes from the API to the coordinator only
 #   ./deploy-citus.sh search-up   # ParadeDB's pg_search (BM25) on every node (service/install-search.sh)
+#   ./deploy-citus.sh gate-up     # the gate writer's login role iq_gate (slice 5; up and hosts-up run it too)
+#   ./deploy-citus.sh backup-up   # pgBackRest on every node into Vultr bucket iq-citus-backup: WAL + a full backup
 #   ./deploy-citus.sh status      # every iq-citus instance
 #   ./deploy-citus.sh psql [sql]  # the coordinator as postgres, over ssh (superuser stays on the host)
 #
@@ -166,7 +173,125 @@ SQL
     '{mode:"hosts", subnet:$s, coordinator:{host:$c, port:5432, unit:"coord"},
       workers:{($p1+":5432"):{name:"w1",host:$h1,port:5432,unit:"node"}, ($p2+":5432"):{name:"w2",host:$h2,port:5432,unit:"node"},
                ($p3+":5432"):{name:"w3",host:$h3,port:5432,unit:"node"}}, spare:($p3+":5432")}' > "$STATE/topology.json"
+  gate_up
+  use_watch "$PUB_coord"
   say "running: $LABEL over hosts (coordinator $PUB_coord)"
+}
+
+# --- parking (slice 5): stopped cleanly, snapshotted, destroyed; restored on the same VPC, renamed in Citus -----------
+PARKED="$STATE/parked.json"
+
+hosts_park() {
+  local n id ip snap st
+  [ "$(jq -r .mode "$STATE/topology.json" 2>/dev/null)" = hosts ] || { echo "no hosts cluster to park" >&2; exit 1; }
+  # every node stopped as a shutdown stops it (checkpoint, clients told), the coordinator first: no new transaction
+  # reaches a worker while the workers stop; then the disks are synced and the instances halted
+  for n in coord w1 w2 w3; do
+    ip=$(jq -r --arg n "$n" 'if $n == "coord" then .coordinator.host else (.workers[] | select(.name == $n) | .host) end' "$STATE/topology.json")
+    ssh "${SSHO[@]}" "root@$ip" 'systemctl stop iq-pgduck iq-s3 2>/dev/null; for u in $(systemctl list-units --plain --no-legend "iq-citus@*" | awk "{print \$1}"); do systemctl stop "$u"; done; sync' || true
+    say "stopped $LABEL-$n"
+  done
+  echo '{}' > "$PARKED.new"
+  for n in coord w1 w2 w3; do
+    id=$(by_label "$LABEL-$n"); [ -n "$id" ] || continue
+    api POST "/instances/$id/halt" >/dev/null
+  done
+  for n in coord w1 w2 w3; do
+    id=$(by_label "$LABEL-$n"); [ -n "$id" ] || continue
+    for _ in $(seq 60); do [ "$(api GET "/instances/$id" | jq -r .instance.power_status)" = stopped ] && break; sleep 5; done
+    snap=$(api POST /snapshots "$(jq -n --arg i "$id" --arg d "$LABEL-parked $n $(date -u +%FT%TZ)" '{instance_id:$i,description:$d}')" | jq -r .snapshot.id)
+    jq --arg n "$n" --arg s "$snap" --arg i "$id" '.[$n] = {snapshot: $s, instance: $i}' "$PARKED.new" > "$PARKED.tmp" && mv "$PARKED.tmp" "$PARKED.new"
+    say "snapshotting $LABEL-$n -> $snap"
+  done
+  for n in coord w1 w2 w3; do
+    snap=$(jq -r --arg n "$n" '.[$n].snapshot' "$PARKED.new"); st=""
+    for _ in $(seq 240); do st=$(api GET "/snapshots/$snap" | jq -r .snapshot.status); [ "$st" = complete ] && break; sleep 15; done
+    [ "$st" = complete ] || { say "snapshot $snap of $LABEL-$n is '$st': nothing destroyed; start the instances again"; exit 1; }
+  done
+  cp "$STATE/topology.json" "$STATE/topology-parked.json"
+  mv "$PARKED.new" "$PARKED"
+  for n in coord w1 w2 w3; do
+    id=$(jq -r --arg n "$n" '.[$n].instance' "$PARKED"); api DELETE "/instances/$id" >/dev/null; say "destroyed $LABEL-$n ($id)"
+  done
+  rm -f "$STATE/topology.json" "$STATE/host"
+  say "parked: $(jq -r 'to_entries | map("\(.key) \(.value.snapshot)") | join(", ")' "$PARKED")"
+}
+
+on_vpc_fix() { # host private_ip: the private interface gets the address Vultr gave the restored instance
+  ssh "${SSHO[@]}" "root@$1" "PRIV=$2 MASK=$VPC_MASK bash -s" <<'NET'
+set -e
+for _ in $(seq 30); do ip -br addr | grep -q " $PRIV/" && exit 0; sleep 2; done
+dev=$(ip -br link | awk '$1 != "lo" && $1 != "enp1s0" {print $1; exit}')
+con=$(nmcli -t -f NAME,DEVICE con show | awk -F: -v d="$dev" '$2 == d {print $1; exit}')
+[ -n "$con" ] || con=$(nmcli -t -f NAME con show | grep -x "System $dev" || true)
+nmcli con mod "$con" ipv4.method manual ipv4.addresses "$PRIV/$MASK"
+nmcli con up "$con" >/dev/null
+NET
+}
+
+hosts_restore() {
+  local fw_id vpc_id n snap id st ip priv old
+  [ -s "$PARKED" ] || { echo "nothing parked" >&2; exit 1; }
+  fw_id=$(firewall); vpc_id=$(vpc)
+  kv() { eval "$1_$2=\$3"; }; at() { eval "echo \${$1_$2}"; }
+  for n in coord w1 w2 w3; do
+    snap=$(jq -r --arg n "$n" '.[$n].snapshot' "$PARKED")
+    id=$(api POST /instances "$(jq -n --arg r "$REGION" --arg p "$PLAN" --arg s "$snap" --arg l "$LABEL-$n" --arg f "$fw_id" --arg v "$vpc_id" \
+        '{region:$r,plan:$p,snapshot_id:$s,label:$l,hostname:$l,firewall_group_id:$f,attach_vpc:[$v],backups:"disabled"}')" | jq -r .instance.id)
+    kv ID "$n" "$id"; say "restoring $LABEL-$n from $snap -> $id"
+  done
+  for n in coord w1 w2 w3; do
+    id=$(at ID "$n")
+    for _ in $(seq 1 120); do
+      read -r st ip < <(api GET "/instances/$id" | jq -r '.instance | "\(.status) \(.main_ip)"')
+      priv=$(private_ip "$id")
+      [ "$st" = active ] && [ "$ip" != 0.0.0.0 ] && [ -n "$priv" ] && break; sleep 10
+    done
+    ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+    wait_ssh "$ip" || { say "no ssh to $LABEL-$n $ip"; exit 1; }
+    on_vpc_fix "$ip" "$priv"
+    kv PUB "$n" "$ip"; kv PRIV "$n" "$priv"
+    say "$LABEL-$n: $ip, private $priv"
+  done
+  # each node listens on its new private address; the workers start first, then the coordinator
+  for n in w1 w2 w3 coord; do
+    ssh "${SSHO[@]}" "root@$(at PUB "$n")" "sed -i \"s/^listen_addresses = .*/listen_addresses = '127.0.0.1,$(at PRIV "$n")'/\" /var/lib/pgsql/17/*/iq.conf
+      for u in /var/lib/pgsql/17/*/iq.conf; do systemctl restart iq-citus@\$(basename \$(dirname \$u)); done
+      systemctl start iq-s3 iq-pgduck 2>/dev/null || true"
+  done
+  # Citus knows its nodes by their private addresses: rename every one that moved
+  local sql="SELECT citus_set_coordinator_host('$PRIV_coord', 5432);"
+  for n in w1 w2 w3; do
+    old=$(jq -r --arg n "$n" '.workers | to_entries[] | select(.value.name == $n) | .key | split(":")[0]' "$STATE/topology-parked.json")
+    [ "$old" = "$(at PRIV "$n")" ] || sql="$sql SELECT citus_update_node(nodeid, '$(at PRIV "$n")', 5432) FROM pg_dist_node WHERE nodename = '$old';"
+  done
+  ssh "${SSHO[@]}" "root@$PUB_coord" "for _ in \$(seq 60); do sudo -u postgres /usr/pgsql-17/bin/pg_isready -q -p 5432 && break; sleep 1; done
+    sudo -u postgres /usr/pgsql-17/bin/psql -X -q -At -v ON_ERROR_STOP=1 -d iq" <<SQL
+$sql
+SELECT 'workers: ' || string_agg(node_name || ':' || node_port, ' ') FROM citus_get_active_worker_nodes();
+SQL
+  echo "$PUB_coord" > "$STATE/host"
+  jq --arg c "$PUB_coord" --arg p1 "$PRIV_w1" --arg h1 "$PUB_w1" --arg p2 "$PRIV_w2" --arg h2 "$PUB_w2" --arg p3 "$PRIV_w3" --arg h3 "$PUB_w3" \
+    '.coordinator.host = $c | .workers = {($p1+":5432"):{name:"w1",host:$h1,port:5432,unit:"node"}, ($p2+":5432"):{name:"w2",host:$h2,port:5432,unit:"node"},
+      ($p3+":5432"):{name:"w3",host:$h3,port:5432,unit:"node"}} | .spare = ($p3+":5432")' "$STATE/topology-parked.json" > "$STATE/topology.json"
+  for n in coord w1 w2 w3; do api DELETE "/snapshots/$(jq -r --arg n "$n" '.[$n].snapshot' "$PARKED")" >/dev/null || true; done
+  rm -f "$PARKED"
+  use_watch "$PUB_coord"
+  say "running again: $LABEL over hosts (coordinator $PUB_coord)"
+}
+
+IDLE_SECS="${IDLE_SECS:-7200}"
+use_watch() { ssh "${SSHO[@]}" "root@$1" bash -s < "$here/service/install-usewatch.sh"; }
+
+autopark() { # park the hosts cluster when no client has had a session for IDLE_SECS (service/install-autopark.sh)
+  local c idle
+  [ "$(jq -r .mode "$STATE/topology.json" 2>/dev/null)" = hosts ] || { say "autopark: no hosts cluster running"; return 0; }
+  c=$(jq -r .coordinator.host "$STATE/topology.json")
+  idle=$(ssh "${SSHO[@]}" "root@$c" 'up=$(cut -d. -f1 /proc/uptime); f=/var/lib/iq-citus/last-use
+    if [ -e "$f" ]; then since=$(( $(date +%s) - $(stat -c %Y "$f") )); else since=$up; fi
+    echo $(( since < up ? since : up ))') || { say "autopark: no ssh to the coordinator $c"; return 0; }
+  if [ "$idle" -ge "$IDLE_SECS" ]; then say "idle ${idle}s >= ${IDLE_SECS}s: parking"; hosts_park
+  else say "in use: idle ${idle}s < ${IDLE_SECS}s"; fi
 }
 
 hosts_down() {
@@ -223,6 +348,37 @@ object_storage() { # the Object Storage subscription that holds iq-blobs (UC_Blo
     '[.object_storages[] | select(.s3_hostname==$h and .status=="active")][0] // empty | "\(.id) \(.s3_hostname) \(.label)"'
 }
 
+make_bucket() { # host bucket: create a bucket on the Object Storage subscription, from the coordinator, by its key file
+  ssh "${SSHO[@]}" "root@$1" "HOST=$2 BUCKET=$3 bash -s" <<'BUCKET'
+set -euo pipefail
+K=$(cut -d: -f1 /root/iq-lake-s3.txt); S=$(cut -d: -f2- /root/iq-lake-s3.txt)
+EMPTY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855   # sha256(""): Vultr wants the payload hash signed
+code=$(curl -s -o /tmp/bucket.out -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user "$K:$S" \
+  -H "x-amz-content-sha256: $EMPTY" -H "Content-Length: 0" -X PUT "https://$HOST/$BUCKET")
+case "$code" in
+  200) echo "bucket $BUCKET on $HOST" ;;
+  409) grep -q BucketAlreadyOwnedByYou /tmp/bucket.out && echo "bucket $BUCKET is already ours" || { cat /tmp/bucket.out; exit 1; } ;;
+  *) echo "bucket $BUCKET: HTTP $code"; cat /tmp/bucket.out; exit 1 ;;
+esac
+rm -f /tmp/bucket.out
+BUCKET
+}
+
+backup_up() { # pgBackRest on every host into its own bucket (slice 5); the key goes coordinator -> host on stdin
+  local c sub host bucket="${BACKUP_BUCKET:-iq-citus-backup}" hosts h
+  c=$(jq -r .coordinator.host "$STATE/topology.json")
+  read -r sub host _ <<<"$(object_storage)"
+  ssh "${SSHO[@]}" "root@$c" 'test -s /root/iq-lake-s3.txt' || \
+    api GET "/object-storage/$sub" | jq -r '.object_storage | "\(.s3_access_key):\(.s3_secret_key)"' | ssh "${SSHO[@]}" "root@$c" 'umask 077; cat > /root/iq-lake-s3.txt'
+  make_bucket "$c" "$host" "$bucket"
+  hosts=$(jq -r '[.coordinator.host] + [.workers[].host] | unique | .[]' "$STATE/topology.json")
+  for h in $hosts; do
+    scp -q "${SSHO[@]}" "$here/service/install-backup.sh" "root@$h:/root/install-backup.sh"
+    ssh "${SSHO[@]}" "root@$c" 'cat /root/iq-lake-s3.txt' | \
+      ssh "${SSHO[@]}" "root@$h" "HOST=$host BUCKET=$bucket CLUSTER=$LABEL bash /root/install-backup.sh"
+  done
+}
+
 lake_vultr() { # the cold tier on Vultr Object Storage: a bucket of its own (LAKE_BUCKET), never iq-blobs
   local h sub host bucket="${LAKE_BUCKET:-iq-lake}"
   h=$(jq -r .coordinator.host "$STATE/topology.json")
@@ -231,23 +387,32 @@ lake_vultr() { # the cold tier on Vultr Object Storage: a bucket of its own (LAK
   # the subscription's S3 key, from the API straight into a root-only file on the coordinator (never on this disk)
   api GET "/object-storage/$sub" | jq -r '.object_storage | "\(.s3_access_key):\(.s3_secret_key)"' |
     ssh "${SSHO[@]}" "root@$h" 'umask 077; cat > /root/iq-lake-s3.txt'
-  ssh "${SSHO[@]}" "root@$h" "HOST=$host BUCKET=$bucket bash -s" <<'BUCKET'
-set -euo pipefail
-K=$(cut -d: -f1 /root/iq-lake-s3.txt); S=$(cut -d: -f2- /root/iq-lake-s3.txt)
-EMPTY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855   # sha256(""): Vultr wants the payload hash signed
-code=$(curl -s -o /tmp/bucket.out -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user "$K:$S" \
-  -H "x-amz-content-sha256: $EMPTY" -H "Content-Length: 0" -X PUT "https://$HOST/$BUCKET")
-case "$code" in
-  200) echo "created bucket $BUCKET on $HOST" ;;
-  409) grep -q BucketAlreadyOwnedByYou /tmp/bucket.out && echo "bucket $BUCKET is already ours" || { cat /tmp/bucket.out; exit 1; } ;;
-  *) echo "bucket $BUCKET: HTTP $code"; cat /tmp/bucket.out; exit 1 ;;
-esac
-rm -f /tmp/bucket.out
-BUCKET
+  make_bucket "$h" "$host" "$bucket"
   # what the loopback store held was test data: its Iceberg table and the store itself go
   ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -d iq -c 'DROP TABLE IF EXISTS iq.event_cold CASCADE' 2>&1 | grep -v NOTICE || true
     systemctl disable -q --now iq-s3 2>/dev/null || true"
   ssh "${SSHO[@]}" "root@$h" "S3_ENDPOINT=$host S3_BUCKET=$bucket S3_KEY_FILE=/root/iq-lake-s3.txt bash -s" < "$here/service/install-lake.sh"
+}
+
+gate_up() { # the gate writer's login (slice 5): made on the coordinator, into every node's .pgpass, never on this disk
+  local c hosts h
+  c=$(jq -r .coordinator.host "$STATE/topology.json")
+  ssh "${SSHO[@]}" "root@$c" 'bash -s' <<'GATE'
+set -euo pipefail
+umask 077
+[ -s /root/citus-gate.txt ] || printf 'iq_gate:%s\n' "$(openssl rand -hex 24)" > /root/citus-gate.txt
+PW=$(cut -d: -f2- /root/citus-gate.txt)
+sudo -u postgres /usr/pgsql-17/bin/psql -X -q -v ON_ERROR_STOP=1 -d iq <<SQL
+DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq_gate') THEN CREATE ROLE iq_gate; END IF; END \$\$;
+ALTER ROLE iq_gate LOGIN PASSWORD '$PW';
+SQL
+GATE
+  hosts=$(jq -r '[.coordinator.host] + [.workers[].host] | unique | .[]' "$STATE/topology.json")
+  for h in $hosts; do
+    ssh "${SSHO[@]}" "root@$c" 'cut -d: -f2- /root/citus-gate.txt' | ssh "${SSHO[@]}" "root@$h" \
+      'read -r pw; f=/var/lib/pgsql/.pgpass; grep -v ":iq_gate:" "$f" > "$f.new" || true; printf "*:*:*:iq_gate:%s\n" "$pw" >> "$f.new"; mv "$f.new" "$f"; chown postgres:postgres "$f"; chmod 600 "$f"'
+  done
+  say "iq_gate can log in; its password is on the coordinator (/root/citus-gate.txt) and in each node's .pgpass"
 }
 
 search_up() { # pg_search on every node's host, then the extension (created on the coordinator, propagated)
@@ -278,6 +443,7 @@ up() {
   say "installing on $ip"
   ssh "${SSHO[@]}" "root@$ip" bash -s < "$here/service/install-citus.sh"
   single_topology "$ip"
+  gate_up
   say "running: $LABEL $ip"
 }
 
@@ -301,12 +467,14 @@ status() {
 
 case "${1:-}" in
   up|down|status) tunnel; "$1" ;;
-  hosts-up|hosts-down|lake-build|lake-build-down) tunnel; f="${1//-/_}"; "$f" ;;
+  hosts-up|hosts-down|hosts-park|hosts-restore|lake-build|lake-build-down|autopark) tunnel; f="${1//-/_}"; "$f" ;;
   lake-up) lake_up ;;
   search-up) search_up ;;
+  gate-up) gate_up ;;
+  backup-up) tunnel; backup_up ;;
   object-storage) tunnel; object_storage ;;
   lake-vultr) tunnel; lake_vultr ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | lake-vultr | search-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 up | down | hosts-up | hosts-down | hosts-park | hosts-restore | autopark | lake-build | lake-build-down | lake-up | lake-vultr | search-up | gate-up | backup-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
 esac

@@ -62,10 +62,11 @@ Feature: SHACL shapes enforced at commit, as GraphDB enforces them
     And a Claim "test:claim-ok" with every required property is committed
     Then the commit is refused by the shapes, naming "extractor" for "minCount"
 
-  Scenario: An agent cannot write around the shapes
+  Scenario: The gate's writer cannot write around the shapes, and an agent cannot write at all
     Then as the agent role a triple written straight into the record is denied
-    And as the agent role a Claim with no subject_iri is refused by the shapes
-    And as the agent role a Claim "test:agent-ok" with every required property commits
+    And as the agent role the governed write itself is denied
+    And as the gate's writer a Claim with no subject_iri is refused by the shapes
+    And as the gate's writer a Claim "test:agent-ok" with every required property commits
 
   Scenario: The cluster and UC_OntologyPipeline's validator agree, violation for violation
     When 200 datums generated from the Store shapes, most broken one way, are checked by the cluster inside a transaction

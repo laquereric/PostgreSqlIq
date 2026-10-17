@@ -191,8 +191,35 @@ conversation.
    - Breaks caught: the walk stopped at one hop (3 fail), seed classes not expanded, the walk let through the
      vocabulary (the size is no longer flat); a search's write committed early.
    - Not yet: the ProtegeIq vocabulary and a WebScrape corpus as real loads; global BM25 statistics.
-5. **Operations.** Park/restore like MarkLogic (snapshot per host), backups (pgBackRest to Blob), and the gate as
-   the only writer.
+5. **Operations.** **Built 2026-10-17.**
+   - **The gate is the only writer** ([`GATE-hosts.md`](GATE-hosts.md), `gated_plane.py`, `gate/iam.json`): an
+     agent's role (`iq_agent`) reads and writes nothing -- not a raw INSERT, not `iq.put_datum`; the one
+     application role with the governed write is `iq_gate` (password made on the coordinator by `gate-up`, in each
+     node's .pgpass, never on this disk), held by `GatedWriter`, which asks the real Rust gate (cpcp-gate, UC_Progress's
+     demo gate with this use case's policy) for every put, get and query under a fresh operationId and stamps the
+     datum with it (`iq.datum.operation`). A put the gate refuses writes nothing; one it admits but the shapes refuse
+     lands nothing; `audit()` finds every datum on the cluster admitted in the gate's journal and every admitted put on
+     the cluster. 5 scenarios; the SHACL agent scenario now reads: the agent cannot write at all, the gate's writer
+     cannot write around the shapes. Breaks caught (refusals ignored: 2 fail; the agent granted the write).
+   - **Backups** ([`BACKUP-hosts.md`](BACKUP-hosts.md), `backup-up`, `service/install-backup.sh`): pgBackRest 2.59 on
+     every node, WAL archived continuously and full backups, in a Vultr bucket of its own, `iq-citus-backup`. The
+     drill: a datum before a `citus_create_restore_point`, one after; the worker holding them restored from its
+     backup beside the live one, to that point, started on another port: it holds the first and not the second (35 s).
+     Restoring to the latest instead of the point is caught.
+   - **Park and restore** (`hosts-park`, `hosts-restore`; `autopark` + `service/install-autopark.sh` after 2 h with no
+     client session, as UC_MarkLogic's): every node stopped cleanly (coordinator first), the four halted, snapshotted,
+     destroyed; restored from the snapshots on the same VPC, each node listening on the private address it was given
+     and renamed in Citus (`citus_update_node`, `citus_set_coordinator_host`). **Done once, for real**: parked in
+     14.5 min (four snapshots, then four instances destroyed), restored in 9 min (new instances, every public address
+     changed). A datum written before parking answers after; Citus, pgvector, pg_lake and pg_search come back; all
+     47 scenarios of the seven features pass on the restored cluster, and the plane's conformance suite 38 of 38.
+     Vultr gave the four the same private addresses again, so the renaming was not exercised this time.
+   - Found by the drill after the restore: `pg_ctl start` returns once a restored server serves reads, while it is
+     still replaying towards the point -- and ParadeDB Community refuses reads from a server in recovery. The
+     drill now waits for the promotion (`pg_is_in_recovery()` false) before it reads.
+   - Not yet: a key scoped to the backup and lake buckets (the subscription's key is on every node); backups on a
+     schedule (pg_cron or a timer); restoring the whole cluster to a point, not one worker; autopark installed
+     (`service/install-autopark.sh` is written; loading the LaunchAgent is the user's call).
 
 ## Run
 

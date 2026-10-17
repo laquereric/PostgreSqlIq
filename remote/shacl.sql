@@ -13,8 +13,8 @@
 --                            sends PREPARE to any worker -- each written datum is held to the shapes; a violation
 --                            raises check_violation with the report as DETAIL, and the transaction rolls back
 --   iq.shacl_check(datum)    the report on demand (as Stardog's integrity check can be run), the same code
---   iq_agent                 a role that may write ONLY through put_datum: for it the shapes cannot be gone around
---                            (the functions run as iq; an agent reads through them too, in a transaction it writes)
+--   iq_agent                 an agent's role: it reads, and writes nothing (slice 5; before, only through put_datum)
+--   iq_gate                  the gate's writer (gated_plane.py): the only application role with put_datum
 --
 -- SHACL Core supported: sh:targetClass (and its subclasses, from iq.vocab), sh:property with an IRI sh:path and
 -- sh:minCount, sh:maxCount, sh:datatype, sh:nodeKind, sh:class (the value's type read across every datum, the
@@ -156,7 +156,12 @@ DROP TRIGGER IF EXISTS shacl_at_commit ON iq.shacl_pending;
 CREATE CONSTRAINT TRIGGER shacl_at_commit AFTER INSERT ON iq.shacl_pending DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION iq.shacl_at_commit();
 
-CREATE OR REPLACE FUNCTION iq.put_datum(datum text, tier text, body jsonb, embedding vector, quads jsonb)
+-- the governed write (slice 5: with the plane's fields and the gate's operation in the same call, so the whole write
+-- runs as one user -- Citus refuses two users on the same shards in one transaction)
+DROP FUNCTION IF EXISTS iq.put_datum(text, text, jsonb, vector, jsonb);
+CREATE OR REPLACE FUNCTION iq.put_datum(datum text, tier text, body jsonb, embedding vector, quads jsonb,
+    raw text DEFAULT NULL, media_type text DEFAULT NULL, derived_from text[] DEFAULT '{}', recorded text DEFAULT NULL,
+    operation text DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $fn$
 BEGIN
     -- refused here, with its own code: from a worker, through INSERT ... SELECT, Citus returns the error as XX000
@@ -165,7 +170,8 @@ BEGIN
         RAISE EXCEPTION 'a triple of % has no subject, predicate or object', datum USING ERRCODE = 'not_null_violation';
     END IF;
     DELETE FROM iq.datum d WHERE d.iri = datum;
-    INSERT INTO iq.datum (iri, tier, body, embedding) VALUES (datum, tier, body, embedding);
+    INSERT INTO iq.datum (iri, tier, body, embedding, raw, media_type, derived_from, recorded, operation)
+        VALUES (datum, tier, body, embedding, raw, media_type, coalesce(derived_from, '{}'), recorded, operation);
     INSERT INTO iq.quad (g, s, p, o, lit, dt, ng, lang)
         SELECT datum, x.s, x.p, x.o, coalesce(x.lit, false), x.dt, coalesce(x.ng, ''), x.lang
           FROM jsonb_to_recordset(quads) AS x(s text, p text, o text, lit boolean, dt text, ng text, lang text)
@@ -187,14 +193,24 @@ $fn$;
 -- functions are iq's, not postgres's. iq_agent reaches the record only through them.
 ALTER FUNCTION iq.shacl_check(text) OWNER TO iq;
 ALTER FUNCTION iq.shacl_at_commit() OWNER TO iq;
-ALTER FUNCTION iq.put_datum(text, text, jsonb, vector, jsonb) OWNER TO iq;
+ALTER FUNCTION iq.put_datum(text, text, jsonb, vector, jsonb, text, text, text[], text, text) OWNER TO iq;
 ALTER FUNCTION iq.drop_datum(text) OWNER TO iq;
 
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq_agent') THEN CREATE ROLE iq_agent NOLOGIN; END IF; END $$;
+-- slice 5: the gate's writer is the only application role that writes; it logs in with a password made on the
+-- coordinator (deploy-citus.sh gate-up). An agent reads, and writes nothing -- not even through put_datum.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq_gate') THEN CREATE ROLE iq_gate NOLOGIN; END IF; END $$;
+GRANT USAGE ON SCHEMA iq TO iq_gate;
+GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_gate;
+GRANT SELECT, INSERT, DELETE ON iq.shacl_pending TO iq_gate;
 GRANT iq_agent TO iq;
 GRANT USAGE ON SCHEMA iq TO iq_agent;
 GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_agent;
 GRANT SELECT, INSERT, UPDATE, DELETE ON iq.shape_target, iq.shape_property, iq.shape_closed TO iq;
-GRANT SELECT, INSERT, DELETE ON iq.shacl_pending TO iq, iq_agent;
-GRANT EXECUTE ON FUNCTION iq.put_datum(text, text, jsonb, vector, jsonb), iq.drop_datum(text),
-    iq.shacl_check(text), iq.term(text, boolean, text) TO iq, iq_agent;
+REVOKE ALL ON iq.shacl_pending FROM iq_agent;
+GRANT SELECT, INSERT, DELETE ON iq.shacl_pending TO iq;
+REVOKE EXECUTE ON FUNCTION iq.put_datum(text, text, jsonb, vector, jsonb, text, text, text[], text, text), iq.drop_datum(text)
+    FROM PUBLIC, iq_agent;
+GRANT EXECUTE ON FUNCTION iq.put_datum(text, text, jsonb, vector, jsonb, text, text, text[], text, text), iq.drop_datum(text)
+    TO iq, iq_gate;
+GRANT EXECUTE ON FUNCTION iq.shacl_check(text), iq.term(text, boolean, text) TO iq, iq_gate, iq_agent;

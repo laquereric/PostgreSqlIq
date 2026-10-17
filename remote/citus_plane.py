@@ -68,6 +68,7 @@ class Cluster:
     port: int = 0
     password: str = field(default="", repr=False)
     _sock: str = ""
+    _others: dict = field(default_factory=dict, repr=False)
 
     @property
     def host(self) -> str:
@@ -104,10 +105,18 @@ class Cluster:
             subprocess.run(["ssh", "-S", self._sock, "-O", "exit", "root@" + self.host], capture_output=True)
             self._sock = ""
 
-    def connect(self, autocommit: bool = False):
+    def connect(self, autocommit: bool = False, role: str = "iq"):
+        """As iq (the owner the scenarios set up and check with), or as another login role -- iq_gate, the gate's
+        writer -- whose password is read once from the coordinator into memory."""
         import psycopg
-        return psycopg.connect(host="127.0.0.1", port=self.port, dbname="iq", user="iq", password=self.password,
+        pw = self.password if role == "iq" else self._password(role)
+        return psycopg.connect(host="127.0.0.1", port=self.port, dbname="iq", user=role, password=pw,
                                autocommit=autocommit, connect_timeout=10)
+
+    def _password(self, role: str) -> str:
+        if role not in self._others:
+            self._others[role] = self.host_sh("cut -d: -f2- /root/citus-%s.txt" % role.replace("iq_", "")).strip()
+        return self._others[role]
 
     def host_sh(self, cmd: str, node: str = COORD, check: bool = True, timeout: int = 600) -> str:
         r = subprocess.run(["ssh", *SSHO, "root@" + self.node(node)["host"], cmd], capture_output=True, text=True,
