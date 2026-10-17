@@ -95,3 +95,82 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
 
   Scenario: Nothing starts the streamer
     Then UC_CDC has no launchd job and no IQ app or service script starts iq-cdc
+
+  Scenario: The snapshot ships the rows that were there before the slot, typed as the stream types them
+    Given a notes table holding 3 notes before CDC is set up
+    And the IQ Server is up
+    When the snapshot runs
+    Then it is done with 3 rows of public.notes
+    And the server holds 3 records of op cdc:snapshot, with tags as JSON and no identity
+    When note 20 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+
+  Scenario: A transaction committed between the drain and the snapshot is in the rows, and not streamed again
+    Given a notes table holding 2 notes before CDC is set up
+    And the IQ Server is up
+    When note 50 is inserted
+    And the snapshot runs with note 60 inserted between the drain and the snapshot
+    Then the server holds 1 records of op cdc:insert
+    And the server holds 4 records of op cdc:snapshot
+    When the streamer runs one cycle
+    Then the cycle passed over 1 change already in the snapshot and sent 0
+    And the server holds 1 records of op cdc:insert
+    And the slot has nothing left
+    When note 70 is inserted
+    And the streamer runs one cycle
+    Then the server holds 2 records of op cdc:insert
+
+  Scenario: A down server takes no snapshot
+    Given a notes table holding 2 notes before CDC is set up
+    And the IQ Server is down
+    When the snapshot runs
+    Then the snapshot says the server is down and left no state
+
+  Scenario: A snapshot cut short pauses the stream; the re-run ships only what is missing
+    Given a notes table holding 3 notes before CDC is set up
+    And the IQ Server is up but refuses the 2rd batch
+    And batches of 2 records
+    When the snapshot runs
+    Then the snapshot failed at its rows and the state is running
+    When note 30 is inserted
+    And the streamer runs one cycle
+    Then the cycle is paused for the snapshot
+    When the snapshot runs
+    Then it is done with 4 rows of public.notes
+    And the server holds 4 records of op cdc:snapshot
+    And the server holds 1 records of op cdc:insert
+    And the slot has nothing left
+
+  Scenario: Running a finished snapshot again ships nothing new
+    Given a notes table holding 3 notes before CDC is set up
+    And the IQ Server is up
+    When the snapshot runs
+    And the snapshot runs
+    Then the snapshot sent 0 and found 3 already there
+
+  Scenario: Teardown forgets the snapshot with the slot
+    Given a notes table holding 1 notes before CDC is set up
+    And the IQ Server is up
+    When the snapshot runs
+    And CDC is torn down
+    Then there is no snapshot state
+
+  Scenario Outline: A streamed transaction is in the snapshot when the snapshot could see it
+    Then xid <xid> is <seen> in snapshot "<snapshot>"
+
+    Examples:
+      | xid        | snapshot                      | seen    |
+      | 740        | 750:760:752,755               | visible |
+      | 752        | 750:760:752,755               | hidden  |
+      | 753        | 750:760:752,755               | visible |
+      | 760        | 750:760:752,755               | hidden  |
+      | 4294967290 | 4294967300:4294967310:        | visible |
+      | 5          | 4294967300:4294967310:        | visible |
+      | 15         | 4294967300:4294967310:        | hidden  |
+      | 4294967295 | 8589934590:8589934600:        | visible |
+
+  Scenario: A stale token in the environment does not keep a rotated pairing down
+    Given the environment holds an expired token and the paired file a live one
+    When the server is probed
+    Then it is up, and the transport and the tokenizer carry the file's token

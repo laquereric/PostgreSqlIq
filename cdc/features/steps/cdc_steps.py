@@ -5,6 +5,7 @@ EventRelay in-process, with a probe and refusals the scenario sets.
 @facet Gherkin
 """
 import json
+import os
 import subprocess
 
 import psycopg
@@ -78,7 +79,8 @@ def _replica(context):
 def _streamer(context):
     context.conn = context.conn or psycopg.connect(context.dsn, autocommit=True)
     return cdc.Streamer(context.conn, up=context.server.probe, deid=cdc.Deidentifier(context.tokens),
-                        transport=context.server, host="box", batch=getattr(context, "batch", cdc.BATCH))
+                        transport=context.server, host="box", batch=getattr(context, "batch", cdc.BATCH),
+                        state=context.state)
 
 
 # -- setup -------------------------------------------------------------------------------------------------
@@ -120,12 +122,16 @@ def _restart_needed(context):
 
 
 @given("CDC is set up on a fresh notes table")
-def _fresh(context):
+def _fresh(context, before=0):
     cdc.setup(context.dsn, restart_cmd=lambda: cdc.restart(context.pgdata))
-    cdc.teardown(context.dsn)
+    context.state = os.path.join(context.pgdata, "cdc-state", "snapshot.json")
+    cdc.teardown(context.dsn, context.state)
     _sql(context, "DROP TABLE IF EXISTS notes")
     _sql(context, "CREATE TABLE notes (id int PRIMARY KEY, body text, tags jsonb, author text, actor jsonb, "
                   "subject text)")
+    for i in range(1, before + 1):
+        _sql(context, "INSERT INTO notes (id, body, tags, author) VALUES (%s, 'old', '{\"n\": %s}', "
+                      "'pat@example.com')" % (i, i))
     assert cdc.setup(context.dsn)["ok"]
     context.server, context.tokens, context.conn = _Server(), identity_map.IdentityMap("k"), None
 
@@ -228,7 +234,7 @@ def _cycle(context):
 
 @when("CDC is torn down")
 def _teardown(context):
-    cdc.teardown(context.dsn)
+    cdc.teardown(context.dsn, getattr(context, "state", ""))
 
 
 # -- outcomes ----------------------------------------------------------------------------------------------
@@ -329,3 +335,135 @@ def _no_autostart(context):
                            "Development/UseCase/UC_App", "DeployIq", "scripts", "*.plist*"],
                           capture_output=True, text=True).stdout.split()
     assert hits == [], hits
+
+
+# -- the initial snapshot ----------------------------------------------------------------------------------
+@given("a notes table holding {n:d} notes before CDC is set up")
+def _before(context, n):
+    _fresh(context, before=n)
+
+
+def _snapshot(context, between=None):
+    context.snap = cdc.snapshot(context.dsn, _streamer(context), context.state, between=between)
+
+
+@when("the snapshot runs")
+def _run_snapshot(context):
+    _snapshot(context)
+
+
+@when("the snapshot runs with note {n:d} inserted between the drain and the snapshot")
+def _run_snapshot_between(context, n):
+    _snapshot(context, between=lambda: _sql(context, "INSERT INTO notes (id, body) VALUES (%s, 'between')", (n,)))
+
+
+@then("it is done with {n:d} rows of {table}")
+def _done(context, n, table):
+    assert context.snap["ok"] and context.snap["tables"] == {table: n}, context.snap
+    st = cdc.read_state(context.state)
+    assert st["status"] == "done" and st["snapshot"] == context.snap["snapshot"], st
+
+
+def _of_op(context, op):
+    return [r for r in context.server.records() if r["op"] == op]
+
+
+@then("the server holds {n:d} records of op {op}, with tags as JSON and no identity")
+def _snap_typed(context, n, op):
+    recs = _of_op(context, op)
+    assert len(recs) == n, recs
+    assert sorted(r["new"]["tags"]["n"] for r in recs) == list(range(1, n + 1)), recs
+    assert all(r["new"]["author"].startswith("iq:subj:") for r in recs), recs
+    assert all(r["lsn"] == context.snap["lsn"] and r["old"] is None for r in recs)
+
+
+@then("the server holds {n:d} records of op {op}")
+def _holds_op(context, n, op):
+    recs = _of_op(context, op)
+    assert len(recs) == n, [(r["op"], r["new"]) for r in context.server.records()]
+
+
+@then("the cycle passed over {n:d} change already in the snapshot and sent {s:d}")
+def _passed(context, n, s):
+    assert context.out.get("in_snapshot") == n and context.out["sent"] == s and context.out["advanced"], context.out
+
+
+@then("the snapshot says the server is down and left no state")
+def _snap_down(context):
+    assert context.snap == {"ok": False, "server": "down", "http": 0}, context.snap
+    assert not os.path.exists(context.state)
+
+
+@then("the snapshot failed at its rows and the state is running")
+def _snap_failed(context):
+    assert not context.snap["ok"] and context.snap["stage"] == "rows", context.snap
+    assert cdc.read_state(context.state)["status"] == "running"
+
+
+@then("the cycle is paused for the snapshot")
+def _paused(context):
+    assert context.out.get("paused") and context.out["advanced"] is None, context.out
+
+
+@then("the snapshot sent {s:d} and found {a:d} already there")
+def _snap_again(context, s, a):
+    assert context.snap["ok"] and (context.snap["sent"], context.snap["already"]) == (s, a), context.snap
+
+
+@then("there is no snapshot state")
+def _no_state(context):
+    assert not os.path.exists(context.state)
+
+
+@then('xid {xid:d} is {seen} in snapshot "{snap}"')
+def _visible(context, xid, seen, snap):
+    assert cdc.visible(snap, xid) == (seen == "visible"), (xid, snap)
+
+
+# -- credentials -------------------------------------------------------------------------------------------
+class _Answer:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@given("the environment holds an expired token and the paired file a live one")
+def _tokens(context):
+    import tempfile
+    home = tempfile.mkdtemp(prefix="iqcdchome")
+    os.makedirs(os.path.join(home, ".iq"))
+    with open(os.path.join(home, ".iq", "harness-token"), "w") as f:
+        f.write("live-token\n")
+    context.saved_env = {k: os.environ.get(k) for k in ("HOME", "IQ_HARNESS_SESSION")}
+    os.environ.update(HOME=home, IQ_HARNESS_SESSION="expired-token")
+
+
+@when("the server is probed")
+def _probe(context):
+    import urllib.error
+
+    def opener(req, timeout=None):
+        if req.get_header("Authorization") != "Bearer live-token":
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+        return _Answer(200)
+    context.clients = (relay.HttpRelayTransport("https://iq.test", bearer="expired-token"),
+                       identity_map.RemoteTokenizer("https://iq.test", bearer="expired-token"))
+    try:
+        context.probed = cdc.PairedProbe("https://iq.test", *context.clients, opener=opener)()
+    finally:
+        for k, v in context.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@then("it is up, and the transport and the tokenizer carry the file's token")
+def _carry(context):
+    assert context.probed == (True, 200), context.probed
+    assert all(c.headers["Authorization"] == "Bearer live-token" for c in context.clients)

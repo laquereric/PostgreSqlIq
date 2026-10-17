@@ -33,13 +33,28 @@ Kafka" at Sequin, but IQ already has the destination: the [[UC_LaptopCloudBridge
   nothing ships.
 - **The disk is protected from an idle slot.** Setup sets `max_slot_wal_keep_size = 1GB`. Past that, Postgres
   invalidates the slot rather than fill the disk, and `status` and `run` say so.
+- **The rows that were there first (slice 2).** The slot captures from its creation on. `iq-cdc.sh snapshot`
+  ships what existed before, in line with the stream:
+  1. it marks the snapshot running, so the streamer pauses;
+  2. it drains the slot;
+  3. it reads every published table in one `REPEATABLE READ` transaction, recording that transaction's
+     `pg_current_snapshot()`, and ships each row as `cdc:snapshot`;
+  4. it marks the snapshot done in `~/.iq/cdc/snapshot.json`.
+
+  From then on the streamer advances over any transaction visible in that snapshot (it committed after the drain
+  but before the snapshot, so its rows are already in), and ships the rest. Nothing is shipped twice and nothing is
+  missed. A snapshot row's operationId is a function of its content, so a cut-short snapshot re-run ships only
+  what the server lacks, and a re-run over unchanged rows ships nothing. Teardown forgets the snapshot along with
+  the slot.
+- **A rotated token does not stop it.** Each probe tries `$IQ_HARNESS_SESSION`, then re-reads
+  `~/.iq/harness-token`, and the cycle ships with the first credential `/whoami` accepts.
 - **Never autostarted.** There is no launchd job and no app hook. A scenario checks that nothing under UC_App,
   DeployIq, scripts or any plist names it.
 
 **A record** (svc `iq-cdc`, so it lands at `auth/events/dt=<day>/svc=iq-cdc/<opid>.json` in iq-blobs, beside the
 bridge's logs and swept by the same `md_observe`):
 
-    {operation_id, op: cdc:insert|update|delete|truncate, decision: captured, service: iq-cdc, at (commit, UTC),
+    {operation_id, op: cdc:insert|update|delete|truncate|snapshot, decision: captured, service: iq-cdc, at (commit, UTC),
      host, table, lsn, commit_lsn, xid, new, old}
 
 Values are typed by the column's type: integers, floats and booleans become numbers and booleans, json and jsonb
@@ -49,6 +64,7 @@ by default, or the whole row under `REPLICA IDENTITY FULL`.
 **Use** (`iq-cdc.sh`, on the image's Python, against the box's Postgres):
 
     iq-cdc.sh setup [schema.table ...] [--restart]   # once; --restart lets it restart Postgres for wal_level
+    iq-cdc.sh snapshot                               # once after setup: the rows that were there first
     iq-cdc.sh status                                 # slot position, WAL held, server up/down
     iq-cdc.sh once                                   # one cycle
     iq-cdc.sh run [--interval 10]                    # stream in the foreground until Ctrl-C
@@ -57,18 +73,26 @@ by default, or the whole row under `REPLICA IDENTITY FULL`.
 **Live (2026-10-17).** Setup was run on `~/.iq/pg` with `--restart`. The in-app gate reconnected by itself. A
 gate journal row (`cpcp_operations`) was shipped, its actor arrived as an `iq:subj:` token, and `/events/have`
 confirmed the server holds `auth/events/dt=2026-10-17/svc=iq-cdc/<opid>.json`. Against an unreachable server,
-the cycle reported down and advanced nothing.
+the cycle reported down and advanced nothing. Snapshot: the first run shipped all 550 `cpcp_operations` rows,
+then got 401s. The re-run found those 550 on the server, shipped the 9 it lacked (`scrape_*` and new journal
+rows), and finished (`2444:2444:` at 0/20643A8).
 
 **Found.**
+- The first live snapshot stopped on a 401. This shell's `$IQ_HARNESS_SESSION` held an older token that had
+  expired, while `~/.iq/harness-token` had already been rotated, and the env copy was preferred. Every probe now
+  falls back to the file.
 - pgoutput's key-only old tuple (`K`) carries every column, with nulls for the non-key ones. Only the key is
   claimed.
 - After `pg_ctl restart`, pgembed's handle no longer knows the postmaster, so its cleanup leaves it running. The
   scenarios stop it by its data directory.
 
-`features/cdc.feature`: 11 scenarios, all passing in about 1.4 s, on a scratch pgembed cluster with the relay
+`features/cdc.feature`: 26 scenarios, all passing in about 2 s (12 for the stream, 7 for the snapshot plus 8
+xid-visibility examples, 1 for credentials), on a scratch pgembed cluster with the relay
 in-process (nothing reaches the IQ Server):
 
     /Applications/IQ.app/Contents/Resources/python/bin/python3 -m behave features
 
-**Next.** An initial snapshot of existing rows (today capture starts at slot creation); a table filter by
+**Limits.** In a table with no primary key, identical rows have the same content and so one snapshot record.
+
+**Next.** A table filter by
 publication row filter rather than whole tables; the slot's lag on the Dashboard.

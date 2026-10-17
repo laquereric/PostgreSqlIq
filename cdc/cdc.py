@@ -28,6 +28,13 @@ no app hook -- `iq-cdc.sh run` streams in the foreground until stopped. Because 
 forever, setup caps it (`max_slot_wal_keep_size`, default 1GB): past that Postgres invalidates the slot rather
 than fill the disk, and `status` says so.
 
+**The rows that were there first.** The slot captures from its creation on; `iq-cdc.sh snapshot` ships what
+existed before: it drains the slot, reads every published table in one repeatable-read transaction, ships each
+row as `cdc:snapshot` (operationId from the row's content), and records the transaction's `pg_current_snapshot()`.
+From then on the streamer advances over any transaction visible in that snapshot -- committed after the drain but
+before the snapshot, so already in the rows -- and ships the rest: nothing twice, nothing missed. While a
+snapshot is incomplete the streamer pauses; re-running it ships only what the server lacks.
+
 **Who never leaves the box.** Records cross the same de-identification the bridge's Flusher applies (`subject`
 dropped, `subject_iri` and any `iq:identity:` value tokenized by the IdentityMap); in addition any e-mail address
 in a captured value becomes the token of its identity, since a table row is not a log and may hold one anywhere.
@@ -200,6 +207,7 @@ class Decoder:
             b.take("b")
             b.take("q")
             end, at = lsn_text(b.take("q")), _ts(b.take("q"))
+            self.last_end = end
             done, self.txn = self.txn, []
             for ch in done:
                 ch["commit_lsn"], ch["at"] = end, at
@@ -237,8 +245,11 @@ def setup(d: str, tables=(), *, restart_cmd=None, wal_cap: str = WAL_CAP) -> dic
     return {"ok": True, **status(d)}
 
 
-def teardown(d: str) -> dict:
-    """Drop the slot (so it stops holding WAL) and the publication. wal_level is left as it is."""
+def teardown(d: str, state: str = "") -> dict:
+    """Drop the slot (so it stops holding WAL), the publication and the snapshot state (its boundary belonged to
+    that slot). wal_level is left as it is."""
+    if state and os.path.exists(state):
+        os.remove(state)
     with _connect(d) as c:
         slot = bool(c.execute("select 1 from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone())
         if slot:
@@ -340,27 +351,42 @@ def server_up(base: str, bearer: str, opener=None) -> tuple:
 class Streamer:
     """One cycle = if the server is up: peek, decode, de-identify, negotiate have/missing, ship in batches,
     advance the slot past each transaction whose every record the server holds. The connection, the server
-    probe, the de-identifier and the transport (have/send) are injected."""
+    probe, the de-identifier and the transport (have/send) are injected. `state` is the snapshot state file: while
+    a snapshot is incomplete the streamer pauses (unless it is the snapshot's own drain); once one is done, a
+    transaction the snapshot already saw is advanced over, not shipped."""
 
-    def __init__(self, conn, *, up, deid, transport, host: str = "", limit: int = 1000, batch: int = BATCH):
+    def __init__(self, conn, *, up, deid, transport, host: str = "", limit: int = 1000, batch: int = BATCH,
+                 state: str = "", draining: bool = False):
         self.c, self.up, self.deid, self.t = conn, up, deid, transport
         self.host, self.limit, self.batch = host, limit, batch
+        self.state, self.draining = state, draining
         self.sysid = system_id(conn)
 
     def cycle(self) -> dict:
         ok, http = self.up()
         if not ok:
             return {"server": "down", "http": http, "sent": 0, "already": 0, "advanced": None}
+        snap = read_state(self.state)
+        if snap.get("status") == "running" and not self.draining:
+            return {"server": "up", "http": http, "sent": 0, "already": 0, "advanced": None,
+                    "paused": "snapshot incomplete -- run: iq-cdc.sh snapshot"}
+        seen = snap.get("snapshot") if snap.get("status") == "done" else None
         rows = peek(self.c, self.limit)
-        dec, txns = Decoder(), []                # [(end_lsn, [records])]
+        dec, txns, skipped = Decoder(), [], 0    # [(end_lsn, [records])]
         for lsn, _xid, data in rows:
             got = dec.feed(lsn, data)
             if isinstance(got, tuple):
                 txns.append((got[1], []))
             elif got is not None:
+                if seen and visible(seen, got[0]["xid"]):
+                    skipped += len(got)          # its rows are in the snapshot already
+                    txns.append((dec.last_end, []))
+                    continue
                 txns.append((got[0]["commit_lsn"], [record(ch, self.sysid, self.host) for ch in got]))
         out = {"server": "up", "http": http, "transactions": len(txns), "sent": 0, "already": 0,
                "advanced": None}
+        if skipped:
+            out["in_snapshot"] = skipped
         if not txns:
             return out
         try:
@@ -370,10 +396,7 @@ class Streamer:
             return out
         sent, todo = 0, flat                    # until have() answers, everything is unacked
         try:
-            keys = [_relay.key_for(r) for _, r in flat]
-            have = set(self.t.have(keys)) if keys else set()
-            out["already"] = sum(k in have for k in keys)
-            todo = [(end, r) for (end, r), k in zip(flat, keys) if k not in have]
+            todo, out["already"] = missing(self.t, flat)
             for i in range(0, len(todo), self.batch):
                 self.t.send([r for _, r in todo[i:i + self.batch]])
                 sent = min(i + self.batch, len(todo))
@@ -400,16 +423,158 @@ class Streamer:
         return safe
 
 
-# -- CLI --------------------------------------------------------------------------------------------------
-def _credential() -> str:
-    t = os.environ.get("IQ_HARNESS_SESSION", "")
-    if not t:
+def missing(transport, flat):
+    """Ask the server which of these (end, record) it holds: (the rest, how many it had)."""
+    keys = [_relay.key_for(r) for _, r in flat]
+    have = set(transport.have(keys)) if keys else set()
+    return [(e, r) for (e, r), k in zip(flat, keys) if k not in have], sum(k in have for k in keys)
+
+
+# -- the initial snapshot ---------------------------------------------------------------------------------
+def state_path() -> str:
+    return os.path.join(os.path.expanduser(os.environ.get("IQ_CDC_HOME", "~/.iq/cdc")), "snapshot.json")
+
+
+def read_state(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(path: str, st: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(st, f, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def visible(snapshot: str, xid32: int) -> bool:
+    """Whether a transaction (pgoutput's 32-bit xid) is visible in a pg_current_snapshot() 'xmin:xmax:xip,...':
+    the xid is widened to the epoch nearest the snapshot's xmax (a streamed transaction is recent)."""
+    xmin, xmax, xip = snapshot.split(":")
+    xmin, xmax = int(xmin), int(xmax)
+    x = (xmax & ~0xFFFFFFFF) | (int(xid32) & 0xFFFFFFFF)
+    if x - xmax > 1 << 31:
+        x -= 1 << 32
+    elif xmax - x > 1 << 31:
+        x += 1 << 32
+    return x < xmin or (x < xmax and str(x) not in xip.split(","))
+
+
+def snapshot_record(table: str, row: dict, sysid: str, snap: dict, host: str = "") -> dict:
+    """A row as it stood at the snapshot. Its operationId is a function of the row's content, so re-running a
+    snapshot over an unchanged row is the same key (dedup), and a row changed since is a new record."""
+    body = json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+    opid = hashlib.sha256(("%s:snapshot:%s:%s" % (sysid, table, body)).encode()).hexdigest()[:32]
+    return {"operation_id": "iq:op:" + opid, "op": "cdc:snapshot", "decision": "captured", "service": SERVICE,
+            "at": snap["at"], "host": host, "table": table, "lsn": snap["lsn"], "commit_lsn": snap["lsn"],
+            "xid": None, "new": row, "old": None, "snapshot": snap["snapshot"]}
+
+
+def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: int = 1000) -> dict:
+    """The rows that existed before the slot, shipped once, in line with the stream:
+      1. mark the state running (the streamer pauses; a failure leaves it so, and a re-run starts again);
+      2. drain the slot through `streamer` (the snapshot's own drain);
+      3. read every published table in ONE repeatable-read transaction, recording pg_current_snapshot() and the
+         WAL position, and ship the rows (have/missing, batches);
+      4. mark it done with that snapshot: the streamer then advances over every transaction visible in it
+         (committed after the drain but before the snapshot -- already in the rows), so nothing is shipped twice
+         and nothing is missed.
+    Needs the server up throughout; `between` (tests) runs after the drain, before the snapshot is taken."""
+    ok, http = streamer.up()
+    if not ok:
+        return {"ok": False, "server": "down", "http": http}
+    write_state(state, {"status": "running", "started": datetime.now(timezone.utc).isoformat()})
+    streamer.draining = True
+    try:
+        while True:
+            res = streamer.cycle()
+            if res.get("error") or res["server"] != "up":
+                return {"ok": False, "stage": "drain", **res}
+            if not res["transactions"]:
+                break
+    finally:
+        streamer.draining = False
+    if between:
+        between()
+    import psycopg
+    out = {"ok": True, "tables": {}, "sent": 0, "already": 0}
+    with psycopg.connect(d) as c:               # not autocommit: one transaction, one snapshot
+        c.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        snap_text, lsn, at = c.execute("select pg_current_snapshot()::text, pg_current_wal_lsn()::text, "
+                                       "now()").fetchone()
+        snap = {"snapshot": snap_text, "lsn": lsn,
+                "at": at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
+        tables = c.execute("select schemaname, tablename from pg_publication_tables where pubname=%s "
+                           "order by 1, 2", (PUBLICATION,)).fetchall()
         try:
-            with open(os.path.expanduser("~/.iq/harness-token")) as f:
-                t = f.read().strip()
-        except OSError:
-            t = ""
-    return t
+            for schema, name in tables:
+                table = "%s.%s" % (schema, name)
+                cols = c.execute("select attname, atttypid from pg_attribute where attrelid=%s::regclass "
+                                 "and attnum > 0 and not attisdropped order by attnum",
+                                 (_ident(table),)).fetchall()
+                sel = ", ".join("%s::text" % _ident(n) for n, _ in cols)
+                n = 0
+                with c.cursor(name="iq_cdc_snapshot") as cur:
+                    cur.execute("SELECT %s FROM %s" % (sel, _ident(table)))
+                    while True:
+                        rows = cur.fetchmany(fetch)
+                        if not rows:
+                            break
+                        recs = [streamer.deid(snapshot_record(
+                            table, {cn: (None if v is None else _value(oid, v)) for (cn, oid), v in zip(cols, r)},
+                            streamer.sysid, snap, streamer.host)) for r in rows]
+                        todo, had = missing(streamer.t, [(None, r) for r in recs])
+                        for i in range(0, len(todo), streamer.batch):
+                            streamer.t.send([r for _, r in todo[i:i + streamer.batch]])
+                        out["sent"] += len(todo)
+                        out["already"] += had
+                        n += len(rows)
+                out["tables"][table] = n
+        except Exception as e:                  # the state stays running: a re-run ships only what is missing
+            return {"ok": False, "stage": "rows", "error": str(e), **{k: out[k] for k in ("tables", "sent", "already")}}
+    write_state(state, {"status": "done", **snap, "tables": out["tables"],
+                        "finished": datetime.now(timezone.utc).isoformat()})
+    return {**out, **snap}
+
+
+# -- CLI --------------------------------------------------------------------------------------------------
+def credentials() -> list:
+    """The paired credentials to try, read afresh each time: $IQ_HARNESS_SESSION, then ~/.iq/harness-token. A
+    long `run` outlives a token (the file is rotated in place; a shell's env copy goes stale), so the probe tries
+    each and the cycle ships with the first the server accepts."""
+    out = []
+    env = os.environ.get("IQ_HARNESS_SESSION", "").strip()
+    if env:
+        out.append(env)
+    try:
+        with open(os.path.expanduser("~/.iq/harness-token")) as f:
+            t = f.read().strip()
+        if t and t not in out:
+            out.append(t)
+    except OSError:
+        pass
+    return out
+
+
+class PairedProbe:
+    """The `up` of a Streamer in prod: a 200 on /whoami for some paired credential, which then becomes the Bearer
+    of the transport and the tokenizer for that cycle."""
+
+    def __init__(self, base: str, *clients, opener=None):
+        self.base, self.clients, self.opener = base, clients, opener
+
+    def __call__(self):
+        http = 0
+        for bearer in credentials():
+            ok, http = server_up(self.base, bearer, self.opener)
+            if ok:
+                for cl in self.clients:
+                    cl.headers = dict(cl.headers, Authorization="Bearer " + bearer)
+                return True, http
+        return False, http
 
 
 def restart(pgdata: str):
@@ -431,6 +596,7 @@ def main(argv=None) -> int:
     s.add_argument("--restart", action="store_true", help="restart Postgres if wal_level must change")
     sub.add_parser("status")
     sub.add_parser("teardown")
+    sub.add_parser("snapshot", help="ship the rows that existed before the slot (drains the slot first)")
     for name in ("once", "run"):
         r = sub.add_parser(name)
         r.add_argument("--interval", type=float, default=10.0)
@@ -442,16 +608,17 @@ def main(argv=None) -> int:
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
     if a.cmd == "teardown":
-        print(json.dumps(teardown(d)))
+        print(json.dumps(teardown(d, state_path())))
         return 0
     base = os.environ.get("IQ_MEMORY", "https://memory.intentionalquality.com")
-    bearer = _credential()
+    creds = credentials()
     if a.cmd == "status":
         st = status(d)
-        st["server"] = {"base": base, "up": server_up(base, bearer)[0] if bearer else False}
+        st["server"] = {"base": base, "up": PairedProbe(base)()[0]}
+        st["snapshot"] = {k: v for k, v in read_state(state_path()).items() if k != "tables"} or None
         print(json.dumps(st, indent=2))
         return 0
-    if not bearer:
+    if not creds:
         print("[iq-cdc] no credential paired (~/.iq/harness-token or IQ_HARNESS_SESSION) -- run iq-login first")
         return 2
     import identity_map
@@ -463,15 +630,22 @@ def main(argv=None) -> int:
         print("[iq-cdc] slot %s lost its WAL (cap %s exceeded) -- teardown and setup again" % (SLOT, st["wal_cap"]))
         return 2
     with _connect(d) as c:
-        st = Streamer(c, up=lambda: server_up(base, bearer),
-                      deid=Deidentifier(identity_map.RemoteTokenizer(base, bearer=bearer)),
-                      transport=_relay.HttpRelayTransport(base, bearer=bearer), host=os.uname().nodename)
+        tokenizer = identity_map.RemoteTokenizer(base, bearer=creds[0])
+        transport = _relay.HttpRelayTransport(base, bearer=creds[0])
+        st = Streamer(c, up=PairedProbe(base, tokenizer, transport), deid=Deidentifier(tokenizer),
+                      transport=transport, host=os.uname().nodename,
+                      state=state_path())
+        if a.cmd == "snapshot":
+            res = snapshot(d, st, state_path())
+            print(json.dumps(res, indent=2))
+            return 0 if res["ok"] else 1
         while True:
             res = st.cycle()
-            if a.cmd == "once" or res["sent"] or res["already"] or res.get("error") or res["server"] == "down":
+            if a.cmd == "once" or res["sent"] or res["already"] or res.get("error") or res.get("paused") \
+                    or res["server"] == "down":
                 print("[iq-cdc] %s %s" % (datetime.now().strftime("%H:%M:%S"), json.dumps(res)), flush=True)
             if a.cmd == "once":
-                return 0 if not res.get("error") and res["server"] == "up" else 1
+                return 0 if not res.get("error") and not res.get("paused") and res["server"] == "up" else 1
             if res["server"] == "up" and res.get("transactions") and not res.get("error"):
                 continue                        # more may be waiting: drain before sleeping
             time.sleep(a.interval)
