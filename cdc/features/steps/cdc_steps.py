@@ -611,3 +611,64 @@ def _writers_ok(context, n):
     _sql(context, "INSERT INTO notes (id, body) VALUES (%s, 'w')", (n,))
     _sql(context, "UPDATE notes SET body = 'w2' WHERE id = %s", (n,))
     _sql(context, "DELETE FROM notes WHERE id = %s", (n,))
+
+
+# -- column lists ------------------------------------------------------------------------------------------
+class _CountingTokens:
+    def __init__(self, inner):
+        self.inner, self.asked = inner, 0
+
+    def tokenize(self, subject_iri):
+        self.asked += 1
+        return self.inner.tokenize(subject_iri)
+
+    def token_for(self, subject_iri):
+        return self.inner.token_for(subject_iri)
+
+
+@when('the columns of {table} are "{names}"')
+def _columns(context, table, names):
+    context.tokens = _CountingTokens(context.tokens) if hasattr(context, "tokens") and context.tokens else None
+    context.narrowed = cdc.set_columns(context.dsn, table, names.split(","))
+
+
+@when("the columns of {table} are cleared")
+def _columns_clear(context, table):
+    context.narrowed = cdc.set_columns(context.dsn, table, None)
+    assert context.narrowed["ok"], context.narrowed
+
+
+@then("every shipped record of {table} carries only {a} and {b}")
+def _only(context, table, a, b):
+    recs = [r for r in context.server.records() if r["table"] == table]
+    assert recs, context.server.records()
+    for r in recs:
+        for side in ("new", "old"):
+            if r[side] is not None:
+                assert set(r[side]) <= {a, b}, (side, r)
+        assert set(r["new"] or r["old"]) == {a, b} or r["op"] == "cdc:delete", r
+
+
+@then("the IdentityMap was asked once, for the e-mail in the body, and never for the unpublished author or actor")
+def _asked_once(context):
+    assert context.tokens.asked == 1, context.tokens.asked      # author (same e-mail) and actor (an IRI) never decoded
+    ins = [r for r in context.server.records() if r["op"] == "cdc:insert"][0]
+    assert ins["new"]["body"].startswith("from iq:subj:"), ins
+
+
+@then("the column list is refused naming the replica identity")
+def _col_refused(context):
+    f = context.narrowed
+    assert not f["ok"] and f["reason"] == "refused" and "replica identity" in (f["detail"] + f["hint"]).lower(), f
+
+
+@then('the publication has filter "{where}" and columns {a}, {b} on {table}')
+def _both(context, where, a, b, table):
+    pub = cdc.status(context.dsn)["publication"]
+    assert pub["filters"] == {table: where} and pub["columns"] == {table: [a, b]}, pub
+
+
+@then('the publication has filter "{where}" and no column list on {table}')
+def _filter_only(context, where, table):
+    pub = cdc.status(context.dsn)["publication"]
+    assert pub["filters"] == {table: where} and pub["columns"] == {}, pub

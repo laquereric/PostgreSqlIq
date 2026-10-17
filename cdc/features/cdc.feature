@@ -260,3 +260,37 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     Then the server holds 1 records of op cdc:insert
     When the filters are reset
     Then the publication still covers schema public with no filters
+
+  Scenario: A column list ships only the listed columns -- the rest never leave the box
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When the columns of public.notes are "id,body"
+    And a note is inserted by "Pat.Doe@Example.com" with actor "iq:identity:d77b333a2e4868e38b54c746" and a column named subject
+    And note 5's body becomes "edited"
+    And the streamer runs one cycle
+    Then every shipped record of public.notes carries only id and body
+    And the IdentityMap was asked once, for the e-mail in the body, and never for the unpublished author or actor
+
+  Scenario: A column list without the key is refused, and nothing changes
+    Given CDC is set up on a fresh notes table
+    When the columns of public.notes are "body,tags"
+    Then the column list is refused naming the replica identity
+    And the publication still covers schema public with no filters
+    And note 1 can still be inserted, updated and deleted
+
+  Scenario: A filter and a column list are kept together
+    Given CDC is set up on a fresh notes table
+    When the filter on public.notes is "id < 100"
+    And the columns of public.notes are "id,body"
+    And the filter on public.notes is "id < 50"
+    Then the publication has filter "(id < 50)" and columns id, body on public.notes
+    When the columns of public.notes are cleared
+    Then the publication has filter "(id < 50)" and no column list on public.notes
+
+  Scenario: The snapshot ships only the listed columns
+    Given a notes table holding 2 notes before CDC is set up
+    And the IQ Server is up
+    When the columns of public.notes are "id,tags"
+    And the snapshot runs
+    Then the server holds 2 records of op cdc:snapshot
+    And every shipped record of public.notes carries only id and tags

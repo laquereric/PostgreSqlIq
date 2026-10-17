@@ -40,6 +40,11 @@ row out of the filter ships as a delete, and one that moves it in ships as an in
 snapshot applies the same filter. A filter Postgres would let break the table's writers (a column outside the
 replica identity) is refused before it lands, unless `--full`.
 
+**Only some columns.** `iq-cdc.sh columns <table> a,b,c` sets a publication column list: a column not
+published never leaves the box, in the stream or the snapshot. The list must include the replica identity, and
+one that does not is refused before it lands. Filters and column lists are kept together: setting one leaves the
+other as it is.
+
 **Who never leaves the box.** Records cross the same de-identification the bridge's Flusher applies (`subject`
 dropped, `subject_iri` and any `iq:identity:` value tokenized by the IdentityMap); in addition any e-mail address
 in a captured value becomes the token of its identity, since a table row is not a log and may hold one anywhere.
@@ -271,20 +276,19 @@ def status(d: str) -> dict:
     with _connect(d) as c:
         level = c.execute("show wal_level").fetchone()[0]
         cap = c.execute("show max_slot_wal_keep_size").fetchone()[0]
-        pub = c.execute("select puballtables, (select array_agg(n.nspname) from pg_publication_namespace pn "
-                        "join pg_namespace n on n.oid=pn.pnnspid where pn.pnpubid=p.oid), "
-                        "(select json_object_agg(schemaname||'.'||tablename, rowfilter) from pg_publication_tables t "
-                        "where t.pubname=p.pubname) from pg_publication p where pubname=%s",
-                        (PUBLICATION,)).fetchone()
+        pub = c.execute("select puballtables, (select array_agg(n.nspname::text) from pg_publication_namespace pn "
+                        "join pg_namespace n on n.oid=pn.pnnspid where pn.pnpubid=p.oid) "
+                        "from pg_publication p where pubname=%s", (PUBLICATION,)).fetchone()
+        spec = _spec(c) if pub else {}
         s = c.execute("select active, confirmed_flush_lsn::text, wal_status, "
                       "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
                       "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint, safe_wal_size "
                       "from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone()
     out = {"wal_level": level, "wal_cap": cap, "publication": None, "slot": None}
     if pub:
-        tf = pub[2] or {}
-        out["publication"] = {"schemas": pub[1] or [], "tables": sorted(tf),
-                              "filters": {t: f for t, f in sorted(tf.items()) if f}}
+        out["publication"] = {"schemas": pub[1] or [], "tables": sorted(spec),
+                              "filters": {t: v["where"] for t, v in sorted(spec.items()) if v["where"]},
+                              "columns": {t: v["columns"] for t, v in sorted(spec.items()) if v["columns"]}}
     if s:
         out["slot"] = {"active": s[0], "confirmed": s[1], "wal_status": s[2], "retained_bytes": s[3],
                        "behind_bytes": s[4], "safe_wal_bytes": s[5]}
@@ -461,28 +465,53 @@ def missing(transport, flat):
 
 
 # -- row filters ------------------------------------------------------------------------------------------
-def set_filter(d: str, table: str, where: str = None, *, full: bool = False) -> dict:
-    """Capture only the rows of `table` matching `where` (a publication row filter, Postgres 15+); `where=None`
-    clears it. A filter needs the table named in the publication, so a schema-wide publication becomes the list of
-    the tables it covers now (new tables are then not captured until `reset_filters`). Postgres refuses UPDATE and
-    DELETE on a table whose filter names a column outside its replica identity -- so every change is proved in its
-    own transaction (a zero-row UPDATE and DELETE, which Postgres checks before touching a row) and rolled back if
-    refused: a filter never breaks a writer. `full` sets REPLICA IDENTITY FULL first, which allows any column (and
-    makes an update or delete carry the whole old row)."""
+KEEP = object()                                 # "leave this part of a table's narrowing as it is"
+
+
+def _spec(c) -> dict:
+    """What the publication captures, per table: {schema.table: {"where": expr | None, "columns": [..] | None}}.
+    Read from pg_publication_rel, where no column list (None) differs from a list naming every column (a column
+    added later is not published); a schema-wide publication's tables come from pg_publication_tables, unnarrowed."""
+    spec = {t: {"where": None, "columns": None} for (t,) in c.execute(
+        "select schemaname||'.'||tablename from pg_publication_tables where pubname=%s", (PUBLICATION,))}
+    for t, where, cols in c.execute(
+            "select n.nspname||'.'||k.relname, pg_get_expr(r.prqual, r.prrelid), "
+            "(select array_agg(a.attname::text order by a.attnum) from pg_attribute a "
+            " where a.attrelid = r.prrelid and a.attnum = any(r.prattrs::int2[])) "
+            "from pg_publication_rel r join pg_publication p on p.oid = r.prpubid "
+            "join pg_class k on k.oid = r.prrelid join pg_namespace n on n.oid = k.relnamespace "
+            "where p.pubname = %s", (PUBLICATION,)):
+        spec[t] = {"where": where, "columns": cols}
+    return spec
+
+
+def narrow(d: str, table: str, *, where=KEEP, columns=KEEP, full: bool = False) -> dict:
+    """Narrow what is captured of `table`: `where` a row filter, `columns` a column list (Postgres 15+); None
+    clears that part, KEEP leaves it. Both need the table named in the publication, so a schema-wide publication
+    becomes the list of the tables it covers now (new tables are then not captured until `reset_filters`).
+    Postgres refuses UPDATE and DELETE on a table whose filter names a column outside its replica identity, or
+    whose column list leaves a replica identity column out -- so every change is proved in its own transaction
+    (a zero-row UPDATE and DELETE, which Postgres checks before touching a row) and rolled back if refused: a
+    narrowing never breaks a writer. `full` sets REPLICA IDENTITY FULL first, which lets a filter name any column
+    (and makes an update or delete carry the whole old row)."""
     import psycopg
     table = _qualified(d, table)
     with psycopg.connect(d) as c:               # one transaction: the change and its proof, or neither
         try:
-            rows = c.execute("select schemaname||'.'||tablename, rowfilter from pg_publication_tables "
-                             "where pubname=%s", (PUBLICATION,)).fetchall()
-            if not rows and not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
+            if not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
                 return {"ok": False, "reason": "no_publication", "detail": "run: iq-cdc.sh setup"}
-            filters = dict(rows)
-            filters[table] = where
+            spec = _spec(c)
+            t = spec.setdefault(table, {"where": None, "columns": None})
+            if where is not KEEP:
+                t["where"] = where
+            if columns is not KEEP:
+                t["columns"] = list(columns) if columns else None
             if full:
                 c.execute("ALTER TABLE %s REPLICA IDENTITY FULL" % _ident(table))
             c.execute("ALTER PUBLICATION %s SET TABLE %s" % (PUBLICATION, ", ".join(
-                _ident(t) + (" WHERE (%s)" % f if f else "") for t, f in sorted(filters.items()))))
+                _ident(n) + (" (%s)" % ", ".join('"%s"' % x.replace('"', '""') for x in v["columns"])
+                             if v["columns"] else "") + (" WHERE (%s)" % v["where"] if v["where"] else "")
+                for n, v in sorted(spec.items()))))
             col = c.execute("select attname from pg_attribute where attrelid=%s::regclass and attnum > 0 "
                             "and not attisdropped order by attnum limit 1", (_ident(table),)).fetchone()[0]
             c.execute("UPDATE %s SET %s = %s WHERE false" % (_ident(table), _ident(col), _ident(col)))
@@ -493,8 +522,19 @@ def set_filter(d: str, table: str, where: str = None, *, full: bool = False) -> 
                     "detail": (e.diag.message_primary or str(e)).strip(),
                     "hint": (e.diag.message_detail or e.diag.message_hint or "")}
     pub = status(d)["publication"]
-    return {"ok": True, "table": table, "where": where, "filters": pub["filters"], "tables": pub["tables"],
-            "schemas": pub["schemas"]}
+    return {"ok": True, "table": table, "filters": pub["filters"], "columns": pub["columns"],
+            "tables": pub["tables"], "schemas": pub["schemas"]}
+
+
+def set_filter(d: str, table: str, where: str = None, *, full: bool = False) -> dict:
+    """Capture only the rows of `table` matching `where`; None clears the filter (its column list is kept)."""
+    return narrow(d, table, where=where, full=full)
+
+
+def set_columns(d: str, table: str, columns=None) -> dict:
+    """Capture only these columns of `table` (they must include its replica identity); None or [] clears the
+    list (its filter is kept). A column not published never leaves the box."""
+    return narrow(d, table, columns=columns)
 
 
 def reset_filters(d: str, schema: str = "public") -> dict:
@@ -535,6 +575,7 @@ def lag(d: str, state: str = "") -> dict:
     out = {"slot": st["slot"], "wal_level": st["wal_level"], "wal_cap": st["wal_cap"], "cap_bytes": cap,
            "tables": (st["publication"] or {}).get("tables", []),
            "filters": (st["publication"] or {}).get("filters", {}),
+           "columns": (st["publication"] or {}).get("columns", {}),
            "schemas": (st["publication"] or {}).get("schemas", []),
            "snapshot": {k: v for k, v in snap.items() if k != "tables"} or None, "last_cycle": last or None}
     s = st["slot"]
@@ -634,14 +675,14 @@ def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: i
                                        "now()").fetchone()
         snap = {"snapshot": snap_text, "lsn": lsn,
                 "at": at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
-        tables = c.execute("select schemaname, tablename, rowfilter from pg_publication_tables where pubname=%s "
-                           "order by 1, 2", (PUBLICATION,)).fetchall()
+        tables = c.execute("select schemaname, tablename, rowfilter, attnames::text[] from pg_publication_tables "
+                           "where pubname=%s order by 1, 2", (PUBLICATION,)).fetchall()
         try:
-            for schema, name, rowfilter in tables:
+            for schema, name, rowfilter, published in tables:
                 table = "%s.%s" % (schema, name)
                 cols = c.execute("select attname, atttypid from pg_attribute where attrelid=%s::regclass "
-                                 "and attnum > 0 and not attisdropped order by attnum",
-                                 (_ident(table),)).fetchall()
+                                 "and attnum > 0 and not attisdropped and attname = any(%s) order by attnum",
+                                 (_ident(table), published)).fetchall()   # what the stream publishes, no more
                 sel = ", ".join("%s::text" % _ident(n) for n, _ in cols)
                 n = 0
                 with c.cursor(name="iq_cdc_snapshot") as cur:
@@ -731,6 +772,10 @@ def main(argv=None) -> int:
     f.add_argument("--clear", action="store_true", help="capture every row of the table again")
     f.add_argument("--full", action="store_true", help="REPLICA IDENTITY FULL, so the filter may name any column")
     f.add_argument("--reset", action="store_true", help="back to every table in public, no filters")
+    k = sub.add_parser("columns", help="capture only some columns of a table (publication column list)")
+    k.add_argument("table", nargs="?", help="schema.table (none: list the column lists)")
+    k.add_argument("names", nargs="?", help="comma-separated columns; must include the replica identity")
+    k.add_argument("--clear", action="store_true", help="capture every column of the table again")
     for name in ("once", "run"):
         r = sub.add_parser(name)
         r.add_argument("--interval", type=float, default=10.0)
@@ -753,6 +798,18 @@ def main(argv=None) -> int:
             return 2
         else:
             res = set_filter(d, a.table, None if a.clear else a.where, full=a.full)
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    if a.cmd == "columns":
+        if not a.table:
+            pub = status(d)["publication"] or {}
+            res = {"ok": True, "schemas": pub.get("schemas", []), "tables": pub.get("tables", []),
+                   "columns": pub.get("columns", {})}
+        elif a.clear == bool(a.names):
+            print("[iq-cdc] give comma-separated columns or --clear")
+            return 2
+        else:
+            res = set_columns(d, a.table, None if a.clear else [x.strip() for x in a.names.split(",") if x.strip()])
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
     if a.cmd == "teardown":

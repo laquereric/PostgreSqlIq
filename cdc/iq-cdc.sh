@@ -11,6 +11,9 @@
 #   iq-cdc.sh filter [schema.table "<where>" [--full] | schema.table --clear | --reset]
 #                                                    capture only matching rows (publication row filter); refused
 #                                                    if it would break the table's UPDATE/DELETE (unless --full)
+#   iq-cdc.sh columns [schema.table a,b,c | schema.table --clear]
+#                                                    capture only these columns (publication column list); must
+#                                                    include the replica identity, refused otherwise
 #   iq-cdc.sh status                                 slot position, WAL held, server up/down
 #   iq-cdc.sh once                                   one cycle (exit 0 = shipped or nothing to ship, server up)
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out

@@ -76,7 +76,15 @@ Kafka" at Sequin, but IQ already has the destination: the [[UC_LaptopCloudBridge
     `--full` sets `REPLICA IDENTITY FULL` to allow any column (and makes a delete carry the whole old row). An
     expression Postgres will not filter on (`random()`, for example) is refused the same way.
 
-  Not applied live: the box's publication is still every table in `public`.
+- **Only some columns (slice 5).** `iq-cdc.sh columns <table> a,b,c` sets a publication column list, and
+  `--clear` removes it. A column that is not published never leaves the box: pgoutput does not send it, the
+  snapshot does not select it, and the IdentityMap is never asked to tokenize it. The list must include the
+  replica identity. One without it would make Postgres refuse every UPDATE and DELETE on the table, so it is proved
+  and rolled back like a filter. Filters and column lists are read back from `pg_publication_rel` (no list is
+  distinct from a list naming every column, whose later columns are not published) and rewritten together, so
+  setting one leaves the other as it is.
+
+  Neither is applied live: the box's publication is still every table in `public`.
 - **Never autostarted.** There is no launchd job and no app hook. A scenario checks that nothing under UC_App,
   DeployIq, scripts or any plist names it.
 
@@ -115,8 +123,8 @@ rows), and finished (`2444:2444:` at 0/20643A8).
 - After `pg_ctl restart`, pgembed's handle no longer knows the postmaster, so its cleanup leaves it running. The
   scenarios stop it by its data directory.
 
-`features/cdc.feature`: 35 scenarios, all passing in about 2.5 s (12 for the stream, 7 for the snapshot plus 8
-xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value, 6 for row filters), on a scratch pgembed cluster with the relay
+`features/cdc.feature`: 39 scenarios, all passing in about 2.5 s (12 for the stream, 7 for the snapshot plus 8
+xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value, 6 for row filters, 4 for column lists), on a scratch pgembed cluster with the relay
 in-process (nothing reaches the IQ Server):
 
     /Applications/IQ.app/Contents/Resources/python/bin/python3 -m behave features
@@ -127,4 +135,4 @@ scratch dashboard on :8031, then back to :8030).
 
 **Limits.** In a table with no primary key, identical rows have the same content and so one snapshot record.
 
-**Next.** Column lists (publish only some columns of a table), the other half of what a publication can narrow.
+**Next.** Nothing queued. The publication can now be narrowed both ways (rows and columns).
