@@ -12,7 +12,6 @@ from behave import given, then, when
 
 import citus_plane as cp
 
-NODE = {5433: "w1", 5434: "w2", 5435: "w3"}
 STORE = cp.NS + "Store"
 A = cp.RDF + "type"
 
@@ -51,20 +50,22 @@ def step_platform(context):
 
 # --- placement ----------------------------------------------------------------------------------------------------
 
-def worker_ports(context):
+def workers(context):
+    """The workers holding datum shards, as `nodename:port`."""
     with context.cluster.connect(autocommit=True) as c:
-        return sorted(r[0] for r in c.execute(
-            "SELECT DISTINCT nodeport FROM citus_shards WHERE table_name = 'iq.datum'::regclass").fetchall())
+        return sorted("%s:%d" % r for r in c.execute(
+            "SELECT DISTINCT nodename, nodeport FROM citus_shards WHERE table_name = 'iq.datum'::regclass").fetchall())
 
 
 @then("the datums' shards are on {n:d} workers")
 def step_on_workers(context, n):
-    ports = worker_ports(context)
-    assert len(ports) == n, ports
+    ws = workers(context)
+    assert len(ws) == n, ws
     with context.cluster.connect(autocommit=True) as c:
-        spread = c.execute("SELECT nodeport, count(*) FROM citus_shards WHERE table_name = 'iq.datum'::regclass "
-                           "GROUP BY 1 ORDER BY 1").fetchall()
-    context.measures["datum shards per worker (%d workers)" % n] = ", ".join("%s %d" % (NODE[p], k) for p, k in spread)
+        spread = c.execute("SELECT nodename || ':' || nodeport, count(*) FROM citus_shards "
+                           "WHERE table_name = 'iq.datum'::regclass GROUP BY 1 ORDER BY 1").fetchall()
+    context.measures["datum shards per worker (%d workers)" % n] = \
+        ", ".join("%s %d" % (context.cluster.name(k), m) for k, m in sorted(spread, key=lambda r: context.cluster.name(r[0])))
 
 
 @then("every datum's triples are on the worker that holds its document")
@@ -75,21 +76,21 @@ def step_colocated(context):
               ON q.table_name = 'iq.quad'::regclass AND d.table_name = 'iq.datum'::regclass
              AND (SELECT shardminvalue FROM pg_dist_shard WHERE shardid = q.shardid)
                = (SELECT shardminvalue FROM pg_dist_shard WHERE shardid = d.shardid)
-             WHERE q.nodeport <> d.nodeport""").fetchall()
+             WHERE (q.nodename, q.nodeport) <> (d.nodename, d.nodeport)""").fetchall()
         groups = c.execute("SELECT count(DISTINCT colocationid) FROM pg_dist_partition "
                            "WHERE logicalrelid IN ('iq.datum'::regclass, 'iq.quad'::regclass)").fetchone()[0]
     assert groups == 1 and not bad, (groups, bad)
     for name in context.platform.datums:
-        assert context.cluster.node_of(name) in NODE
+        assert context.cluster.node_of(name) in context.cluster.topo["workers"]
 
 
 @then("the vocabulary is on every node")
 def step_vocab_everywhere(context):
     n = len(context.platform.vocab)
-    for port in (5432, *worker_ports(context)):
-        got = context.cluster.admin("SELECT count(*) FROM iq.vocab", port) if port == 5432 else \
-            context.cluster.admin("SELECT count(*) FROM iq.vocab_%s" % shard_of_vocab(context), port)
-        assert int(got) == n, (port, got, n)
+    for node in (cp.COORD, *workers(context)):
+        table = "iq.vocab" if node == cp.COORD else "iq.vocab_%s" % shard_of_vocab(context)
+        got = context.cluster.admin("SELECT count(*) FROM %s" % table, node)
+        assert int(got) == n, (context.cluster.name(node), got, n)
 
 
 def shard_of_vocab(context):
@@ -228,10 +229,10 @@ def step_vocab_change(context, cls, name):
 @then('every node\'s copy of the vocabulary holds "{cls}"')
 def step_vocab_copy(context, cls):
     shard = shard_of_vocab(context)
-    for port in (5432, *worker_ports(context)):
-        table = "iq.vocab" if port == 5432 else "iq.vocab_%s" % shard
-        got = context.cluster.admin("SELECT count(*) FROM %s WHERE s = '%s'" % (table, iri(cls)), port)
-        assert got == "1", (port, got)
+    for node in (cp.COORD, *workers(context)):
+        table = "iq.vocab" if node == cp.COORD else "iq.vocab_%s" % shard
+        got = context.cluster.admin("SELECT count(*) FROM %s WHERE s = '%s'" % (table, iri(cls)), node)
+        assert got == "1", (context.cluster.name(node), got)
 
 
 # --- two-phase commit ---------------------------------------------------------------------------------------------
@@ -240,8 +241,7 @@ def on_distinct_workers(context, k=2, prefix="test:pair"):
     seen = {}
     for n in range(200):
         name = "%s-%d" % (prefix, n)
-        port = context.cluster.node_of(iri(name))
-        seen.setdefault(port, name)
+        seen.setdefault(context.cluster.node_of(iri(name)), name)
         if len(seen) >= k:
             return list(seen.items())
     raise AssertionError("no %d workers among the shards" % k)
@@ -305,6 +305,121 @@ def step_neither(context):
     assert pending == "0", "prepared transactions left on the worker: %s" % pending
 
 
+# --- a two-phase commit cut between PREPARE and COMMIT --------------------------------------------------------------
+
+HOLD = """
+SET citus.enable_unsafe_triggers = on;
+CREATE OR REPLACE FUNCTION iq.test_hold_prepare() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.body ? 'iq_test_hold_prepare' THEN PERFORM pg_sleep((NEW.body->>'iq_test_hold_prepare')::float); END IF;
+    RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS test_hold_prepare ON iq.datum;
+CREATE CONSTRAINT TRIGGER test_hold_prepare AFTER INSERT ON iq.datum DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION iq.test_hold_prepare();
+ALTER SYSTEM SET citus.recover_2pc_interval = -1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(2);     -- the reload reaches the maintenance daemon (which recovers two-phase commits) at its next turn
+"""
+UNHOLD = """
+SET citus.enable_unsafe_triggers = on;
+DROP TRIGGER IF EXISTS test_hold_prepare ON iq.datum;
+DROP FUNCTION IF EXISTS iq.test_hold_prepare();
+ALTER SYSTEM RESET citus.recover_2pc_interval;
+SELECT pg_reload_conf();
+"""
+
+
+@given("the first worker holds its PREPARE for {secs:d} seconds")
+def step_hold(context, secs):
+    """A deferred trigger runs when its transaction prepares: on the first datum's worker it sleeps. The coordinator's
+    own recovery of two-phase commits is paused (recover_2pc_interval -1), so the scenario sees what it leaves."""
+    context.cluster.admin(HOLD)
+    context.hold = secs
+
+
+def put_both_while(context, crash: str):
+    (_, a), (b_node, b) = context.pair
+    watcher = context.cluster.crash_once_prepared(crash, b_node)
+    context.refused, t0 = None, time.perf_counter()
+    c = conn(context)
+    try:
+        cp.put(c, iri(a), typed(a, "RecordStore"), body={"iri": iri(a), "iq_test_hold_prepare": context.hold})
+        cp.put(c, iri(b), typed(b, "RecordStore"))
+        c.commit()
+    except psycopg.Error as e:
+        context.refused = e
+    context.commit_ms = (time.perf_counter() - t0) * 1000
+    out, err = watcher.communicate(timeout=120)
+    assert watcher.returncode == 0, "the watcher did not crash %s: %s" % (context.cluster.name(crash), err[-300:])
+    context.crashed = crash
+
+
+@when("one transaction puts both, and the second worker crashes the moment it has prepared")
+def step_crash_worker_2pc(context):
+    put_both_while(context, context.pair[1][0])
+
+
+@when("one transaction puts both, and the coordinator crashes the moment the second worker has prepared")
+def step_crash_coord_2pc(context):
+    put_both_while(context, cp.COORD)
+
+
+@then("the commit succeeds")
+def step_commit_ok(context):
+    assert context.refused is None, context.refused
+    context.measures["2PC, worker crashed after PREPARE: commit answered after"] = "%.0f ms" % context.commit_ms
+
+
+@then("the second worker came back holding the transaction prepared, neither committed nor rolled back")
+def step_in_doubt(context):
+    b_node, b = context.pair[1]
+    assert "not properly shut down" in recovery_log(context, b_node)
+    assert context.cluster.prepared(b_node) == 1, context.cluster.prepared(b_node)
+    with context.cluster.connect(autocommit=True) as c:
+        assert not present(c, b)["document"], "the in-doubt datum is visible before its COMMIT PREPARED"
+
+
+@then("the commit is lost with the connection")
+def step_commit_lost(context):
+    assert isinstance(context.refused, psycopg.OperationalError), context.refused
+    for _ in range(30):
+        try:
+            with context.cluster.connect(autocommit=True):
+                return
+        except psycopg.OperationalError:
+            time.sleep(1)
+    raise AssertionError("the coordinator did not come back")
+
+
+@when("the coordinator recovers its two-phase commits")
+def step_recover(context):
+    time.sleep(max(0.0, context.hold + 1 - context.commit_ms / 1000))   # the held PREPARE has finished
+    t0 = time.perf_counter()
+    n = 0
+    for _ in range(30):
+        n += int(context.cluster.admin("SELECT recover_prepared_transactions()"))
+        if all(context.cluster.prepared(w) == 0 for w in workers(context)):
+            break
+        time.sleep(1)
+    context.measures["2PC recovery after a %s crash: prepared transactions resolved / took" % context.cluster.name(
+        context.crashed).split(":")[0]] = "%d / %.1f s" % (n, time.perf_counter() - t0)
+
+
+@then("neither answers")
+def step_neither_pair(context):
+    with context.cluster.connect(autocommit=True) as c:
+        for _, name in context.pair:
+            p = present(c, name)
+            assert not p["document"] and p["triples"] == 0, (name, p)
+
+
+@then("no prepared transaction is left on any worker")
+def step_no_prepared(context):
+    left = {context.cluster.name(w): context.cluster.prepared(w) for w in workers(context)}
+    assert not any(left.values()), left
+
+
 # --- isolation ----------------------------------------------------------------------------------------------------
 
 @given('"{name}" is committed at tier "{tier}"')
@@ -347,19 +462,19 @@ def step_at_tier(context, name, tier):
 
 @when("the worker holding it is stopped as a crash stops it, and started again")
 def step_crash(context):
-    port = context.cluster.node_of(iri("test:durable"))
-    node = NODE[port]
+    node = context.cluster.node_of(iri("test:durable"))
     t0 = time.perf_counter()
-    context.cluster.host_sh(
-        "sudo -u postgres /usr/pgsql-17/bin/pg_ctl -D /var/lib/pgsql/17/%s stop -m immediate >/dev/null; "
-        "systemctl reset-failed iq-citus@%s 2>/dev/null; systemctl start iq-citus@%s; "
-        "for _ in $(seq 60); do sudo -u postgres /usr/pgsql-17/bin/pg_isready -q -p %d && exit 0; sleep 1; done; exit 1"
-        % (node, node, node, port))
+    context.cluster.crash(node)
     context.measures["worker crash (immediate stop) to accepting again"] = "%.1f s" % (time.perf_counter() - t0)
-    log = context.cluster.host_sh("tail -n 40 $(ls -t /var/lib/pgsql/17/%s/log/*.log | head -1) | "
-                                  "grep -E 'not properly shut down|redo (starts|done)' | sed 's/^[^]]*] //'" % node)
+    log = recovery_log(context, node)
     assert "not properly shut down" in log, "the worker did not start by crash recovery: %r" % log
     context.measures["the worker's restart after the crash"] = "; ".join(l.strip() for l in log.splitlines())[:300]
+
+
+def recovery_log(context, node):
+    unit = context.cluster.node(node)["unit"]
+    return context.cluster.host_sh("tail -n 40 $(ls -t /var/lib/pgsql/17/%s/log/*.log | head -1) | "
+                                   "grep -E 'not properly shut down|redo (starts|done)' | sed 's/^[^]]*] //'" % unit, node)
 
 
 @then('"{name}" answers with its document and its triples')
@@ -376,17 +491,12 @@ def step_durable(context, name):
 
 # --- scale out and in ---------------------------------------------------------------------------------------------
 
-W3 = 5435
-
-
-def in_cluster(context, port):
-    return context.cluster.admin("SELECT count(*) FROM pg_dist_node WHERE nodeport = %d" % port) == "1"
 
 
 @given("the third worker is not in the cluster")
 def step_no_w3(context):
     cp.two_workers(context.cluster)
-    assert not in_cluster(context, W3)
+    assert not cp.in_cluster(context.cluster, context.cluster.spare)
 
 
 def while_writing(context, label, action):
@@ -425,16 +535,16 @@ def while_writing(context, label, action):
 @when("the third worker is added and the shards rebalanced while datums are being put")
 def step_add_w3(context):
     def add():
-        context.cluster.admin("SELECT citus_add_node('localhost', %d); "
+        context.cluster.admin(cp.add_worker_sql(context.cluster.spare) +
                               "SELECT citus_rebalance_start(shard_transfer_mode => 'force_logical'); "
-                              "SELECT citus_rebalance_wait();" % W3)
+                              "SELECT citus_rebalance_wait();")
     while_writing(context, "add a worker and rebalance", add)
 
 
 @when("the third worker is drained and removed while datums are being put")
 def step_remove_w3(context):
     def drain():
-        cp.remove_worker(context.cluster, W3)
+        cp.remove_worker(context.cluster, context.cluster.spare)
     while_writing(context, "drain and remove a worker", drain)
 
 

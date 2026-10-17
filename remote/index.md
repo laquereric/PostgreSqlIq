@@ -72,8 +72,25 @@ conversation.
      read (the lost update).
    - Schema objects are created by `postgres` over ssh: Citus copies a table owner's role to the workers, which
      only a superuser may do. The client role `iq` has data rights only.
-2. **Hosts, not ports.** Workers on their own instances over a Vultr VPC; the same scenarios, plus a two-phase
-   commit interrupted by killing a worker between PREPARE and COMMIT (recovered by the coordinator).
+2. **Hosts, not ports.** **Built 2026-10-17: all 12 scenarios pass on both topologies** ([`ACID-hosts.md`](ACID-hosts.md)).
+   `deploy-citus.sh hosts-up` makes a Vultr VPC (10.31.0.0/24) and four instances -- `iq-citus-coord`, `-w1`,
+   `-w2`, and a spare `-w3` -- one node each (`install-citus.sh` ROLE=coordinator|worker). Postgres listens on
+   loopback and the private address; pg_hba and firewalld admit the subnet only, to 5432 only; the public side stays
+   ssh-only. Passwords are made on the coordinator and piped to the workers over ssh (never on this disk).
+   `topology.json` says what is up, and the same scenarios run on either shape. Two new scenarios cut a two-phase
+   commit between PREPARE and COMMIT (a test trigger holds the first worker's PREPARE 4 s; a watcher on the host
+   crashes a node the instant the second worker has prepared; the coordinator's own 2PC recovery paused):
+   - **a worker crashes after PREPARE:** the commit is answered (4.4 s, Citus warns "failed to commit transaction
+     on" the worker); the worker restarts by WAL recovery still holding the transaction prepared -- its datum
+     invisible -- and `recover_prepared_transactions()` commits it: both datums answer, nothing left prepared.
+   - **the coordinator crashes after PREPARE:** the client loses the connection; with no commit record, recovery
+     rolls back both workers' prepared transactions: neither datum answers. All or nothing, across a crash.
+   - Caught when the recovery is skipped (both fail). Shapes measured: one datum put 251 ms, recovery 1.3 s.
+   - Found on the way: the cleanup of a held scenario failed because `DROP TRIGGER` on a distributed table needs
+     `citus.enable_unsafe_triggers` as much as `CREATE` does; and an installer re-run must not touch roles on a
+     worker already in the cluster ("operation is not allowed on this node").
+   The fork [laquereric/citus](https://github.com/laquereric/citus) (2026-10-17) is where the
+   `citus_remove_node` cleanup fix would go; the cluster still runs the packaged 14.2.
 3. **The plane's adapter.** A `CitusAdapter` for `dataplane.py` (record and graph roles in one), so the conformance
    suite (`GherkinIq/Facet/Store/features/dataplane.feature`) runs against the cluster; `plane_sparql` via the SQL
    translation.
@@ -84,6 +101,6 @@ conversation.
 
 ## Run
 
-    ./deploy-citus.sh up                                   # launch (if absent) + install; ~5 min
+    ./deploy-citus.sh up            # slice 1: one host (or hosts-up: a VPC and a host per node); ~5 min
     cd features && "$(../../UC_App/iq-python.sh --bin)" -m behave   # the 10 scenarios; writes ACID.md
-    ./deploy-citus.sh down                                 # destroy: stops the billing
+    ./deploy-citus.sh down          # or hosts-down: destroy, which is what stops the billing

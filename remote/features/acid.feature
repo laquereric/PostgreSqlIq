@@ -4,7 +4,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
   MarkLogic commits a document, its triples, its text and its vector together, and answers inference at query time
   inside the transaction, so an inference is never stale and never sees another transaction's uncommitted work.
   These scenarios hold a Citus cluster on Vultr (a coordinator and two workers, PostgreSQL 17, Citus 14) to the
-  same promises, with UC_DataPlatform's platform vocabulary and its eight competency questions, the ones MarkLogic
+  same promises -- on one host (slice 1) or one host per node over a VPC (slice 2), whichever deploy-citus.sh put up -- with UC_DataPlatform's platform vocabulary and its eight competency questions, the ones MarkLogic
   already answered (UC_Progress/INFERENCE.md).
 
   Background:
@@ -49,6 +49,27 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     When one transaction puts a datum on one worker and, on the other, a triple whose datum does not exist
     Then the commit is refused
     And neither of the second transaction's writes answers
+
+  @hold
+  Scenario: A two-phase commit whose worker crashes after PREPARE is finished by the coordinator
+    Given two test datums whose shards are on different workers
+    And the first worker holds its PREPARE for 4 seconds
+    When one transaction puts both, and the second worker crashes the moment it has prepared
+    Then the commit succeeds
+    And the second worker came back holding the transaction prepared, neither committed nor rolled back
+    When the coordinator recovers its two-phase commits
+    Then both answer
+    And no prepared transaction is left on any worker
+
+  @hold
+  Scenario: A two-phase commit whose coordinator crashes after PREPARE commits nowhere
+    Given two test datums whose shards are on different workers
+    And the first worker holds its PREPARE for 4 seconds
+    When one transaction puts both, and the coordinator crashes the moment the second worker has prepared
+    Then the commit is lost with the connection
+    When the coordinator recovers its two-phase commits
+    Then neither answers
+    And no prepared transaction is left on any worker
 
   Scenario: A concurrent update is not lost
     Given "test:tiered" is committed at tier "Silver"

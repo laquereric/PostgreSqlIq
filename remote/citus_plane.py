@@ -1,10 +1,14 @@
 """The Citus cluster as the scenarios reach it: a tunnel, two roles, the datum as one transaction, inference in SQL.
 
-    Cluster.open()        an SSH tunnel to the coordinator (127.0.0.1:<port> -> host:5432), the role iq's password
-                          read over ssh into memory (never written here), the schema applied
+    topology()            what deploy-citus.sh put up (~/.iq/citus/topology.json, or IQ_CITUS_TOPOLOGY): the
+                          coordinator's host, and each worker by the name Citus knows it as (`<nodename>:<port>`)
+                          with its host and systemd unit -- one host by ports (slice 1) or one host each (slice 2)
+    Cluster.open()        an SSH tunnel to the coordinator, the role iq's password read over ssh into memory (never
+                          written here), the schema applied as postgres over ssh
     cluster.connect()     a psycopg connection as iq (not autocommit: the caller owns the transaction)
-    cluster.admin(sql)    the coordinator as postgres, over ssh: what only a superuser does (add a node, rebalance)
-    cluster.host_sh(cmd)  a root command on the host (stop a node the way a crash would)
+    cluster.admin(sql, node)   a node as postgres, over ssh: what only a superuser does (add a node, rebalance)
+    cluster.host_sh(cmd, node) a root command on a node's host (stop a node the way a crash would)
+    cluster.node_of(iri)  the worker holding the shard of `iri`
 
     put(c, iri, ...)      one datum -- document, text, vector, triples -- in the caller's transaction
     ask(c, question, inference)   a competency question of UC_DataPlatform/inference (?x in one triple pattern)
@@ -21,7 +25,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import socket
 import subprocess
 import tempfile
@@ -41,13 +44,15 @@ TBOX = {RDFS + "subClassOf", RDFS + "subPropertyOf", RDFS + "domain", RDFS + "ra
         OWL + "equivalentClass", OWL + "equivalentProperty"}
 TEST = NS + "test:"
 SSHO = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+PG = "/usr/pgsql-17/bin"
+COORD = "coordinator"
 
 
-def host() -> str:
-    h = os.environ.get("IQ_CITUS_HOST") or (Path.home() / ".iq/citus/host").read_text().strip()
-    if not h:
-        raise RuntimeError("no Citus host: UC_Citus/deploy-citus.sh up")
-    return h
+def topology() -> dict:
+    p = Path(os.environ.get("IQ_CITUS_TOPOLOGY") or Path.home() / ".iq/citus/topology.json")
+    if not p.exists():
+        raise RuntimeError("no Citus cluster: UC_Citus/deploy-citus.sh up (or hosts-up)")
+    return json.loads(p.read_text())
 
 
 def _free_port() -> int:
@@ -58,14 +63,32 @@ def _free_port() -> int:
 
 @dataclass
 class Cluster:
-    host: str
+    topo: dict
     port: int = 0
     password: str = field(default="", repr=False)
     _sock: str = ""
 
+    @property
+    def host(self) -> str:
+        return self.topo["coordinator"]["host"]
+
+    @property
+    def mode(self) -> str:
+        return self.topo["mode"]
+
+    @property
+    def spare(self) -> str:
+        return self.topo["spare"]
+
+    def node(self, key: str) -> dict:
+        return self.topo["coordinator"] if key == COORD else self.topo["workers"][key]
+
+    def name(self, key: str) -> str:
+        return "coordinator" if key == COORD else self.topo["workers"][key]["name"]
+
     @classmethod
     def open(cls) -> "Cluster":
-        c = cls(host())
+        c = cls(topology())
         c.port = _free_port()
         c._sock = tempfile.mktemp(prefix="iq-citus-", dir="/tmp")
         subprocess.run(["ssh", *SSHO, "-f", "-N", "-M", "-S", c._sock, "-o", "ExitOnForwardFailure=yes",
@@ -84,27 +107,56 @@ class Cluster:
         return psycopg.connect(host="127.0.0.1", port=self.port, dbname="iq", user="iq", password=self.password,
                                autocommit=autocommit, connect_timeout=10)
 
-    def host_sh(self, cmd: str, check: bool = True) -> str:
-        r = subprocess.run(["ssh", *SSHO, "root@" + self.host, cmd], capture_output=True, text=True, timeout=600)
+    def host_sh(self, cmd: str, node: str = COORD, check: bool = True, timeout: int = 600) -> str:
+        r = subprocess.run(["ssh", *SSHO, "root@" + self.node(node)["host"], cmd], capture_output=True, text=True,
+                           timeout=timeout)
         if check and r.returncode:
-            raise RuntimeError("host: %s -> %s" % (cmd, r.stderr.strip()[-500:]))
+            raise RuntimeError("host %s: %s -> %s" % (self.name(node), cmd[:120], r.stderr.strip()[-500:]))
         return r.stdout
 
-    def admin(self, sql: str, port: int = 5432) -> str:
+    def admin(self, sql: str, node: str = COORD) -> str:
         """psql as postgres on a node, the statement on stdin (one value per line, unaligned)."""
-        r = subprocess.run(["ssh", *SSHO, "root@" + self.host,
-                            "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -At -v ON_ERROR_STOP=1 -p %d -d iq" % port],
+        n = self.node(node)
+        r = subprocess.run(["ssh", *SSHO, "root@" + n["host"],
+                            "sudo -u postgres %s/psql -X -q -At -v ON_ERROR_STOP=1 -p %d -d iq" % (PG, n["port"])],
                            input=sql, capture_output=True, text=True, timeout=900)
         if r.returncode:
-            raise RuntimeError("admin: %s -> %s" % (sql.strip()[:120], r.stderr.strip()[-800:]))
+            raise RuntimeError("admin %s: %s -> %s" % (self.name(node), sql.strip()[:120], r.stderr.strip()[-800:]))
         return r.stdout.strip()
 
-    def node_of(self, iri: str) -> int:
-        """The worker port holding the shard of `iri`."""
+    def node_of(self, iri: str) -> str:
+        """The worker (`nodename:port`) holding the shard of `iri`."""
         with self.connect(autocommit=True) as c:
-            return c.execute("SELECT nodeport FROM pg_dist_placement pl JOIN pg_dist_node n USING (groupid) "
+            n, p = c.execute("SELECT nodename, nodeport FROM pg_dist_placement pl JOIN pg_dist_node n USING (groupid) "
                              "WHERE pl.shardid = get_shard_id_for_distribution_column('iq.datum', %s::text)",
-                             (iri,)).fetchone()[0]
+                             (iri,)).fetchone()
+        return "%s:%d" % (n, p)
+
+    def restart_sh(self, node: str) -> str:
+        """Shell: stop a node as a crash does (immediate: no checkpoint, no goodbye to clients), start it, wait."""
+        n = self.node(node)
+        return ("sudo -u postgres {pg}/pg_ctl -D /var/lib/pgsql/17/{u} stop -m immediate >/dev/null; "
+                "systemctl reset-failed iq-citus@{u} 2>/dev/null; systemctl start iq-citus@{u}; "
+                "for _ in $(seq 60); do sudo -u postgres {pg}/pg_isready -q -p {p} && exit 0; sleep 0.5; done; exit 1"
+                ).format(pg=PG, u=n["unit"], p=n["port"])
+
+    def crash(self, node: str) -> None:
+        self.host_sh(self.restart_sh(node), node)
+
+    def crash_once_prepared(self, node: str, watched: str, timeout: int = 30) -> subprocess.Popen:
+        """Start, on `node`'s host, a watcher that crashes `node` the moment `watched` holds a prepared transaction
+        (a two-phase commit between its PREPARE and its COMMIT PREPARED). Returns the running watcher."""
+        w = self.node(watched)
+        nodename = watched.rsplit(":", 1)[0]          # localhost (one host) or its private address (the VPC)
+        poll = ("sudo -u postgres {pg}/psql -X -At -h {h} -p {p} -d iq -c 'SELECT count(*) FROM pg_prepared_xacts'"
+                ).format(pg=PG, h=nodename, p=w["port"])
+        script = ("end=$((SECONDS+%d)); until [ \"$(%s)\" -gt 0 ]; do [ $SECONDS -lt $end ] || exit 3; sleep 0.02; done; %s"
+                  % (timeout, poll, self.restart_sh(node)))
+        return subprocess.Popen(["ssh", *SSHO, "root@" + self.node(node)["host"], script],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def prepared(self, node: str) -> int:
+        return int(self.admin("SELECT count(*) FROM pg_prepared_xacts", node))
 
 
 # --- the platform, as datums -------------------------------------------------------------------------------------
@@ -175,9 +227,14 @@ def load_platform(cluster: Cluster) -> Platform:
 
 
 def two_workers(cluster: Cluster) -> None:
-    """The cluster as a run starts it: w3 (:5435) drained and out, if an earlier run left it in."""
-    if cluster.admin("SELECT count(*) FROM pg_dist_node WHERE nodeport = 5435") == "1":
-        remove_worker(cluster, 5435)
+    """The cluster as a run starts it: the spare drained and out, if an earlier run left it in."""
+    if in_cluster(cluster, cluster.spare):
+        remove_worker(cluster, cluster.spare)
+
+
+def in_cluster(cluster: Cluster, key: str) -> bool:
+    n, p = key.rsplit(":", 1)
+    return cluster.admin("SELECT count(*) FROM pg_dist_node WHERE nodename = '%s' AND nodeport = %d" % (n, int(p))) == "1"
 
 
 # Citus defers dropping a moved shard's old copy (pg_dist_cleanup). citus_remove_node does not purge the records of
@@ -185,9 +242,9 @@ def two_workers(cluster: Cluster) -> None:
 # those shards fails for ever ("the orphaned shard ... could not be cleaned up"). So: drain, clean up until nothing
 # is left on the node, and only then remove it.
 REMOVE = """
-SELECT citus_drain_node('localhost', {port}, shard_transfer_mode => 'force_logical');
+SELECT citus_drain_node('{name}', {port}, shard_transfer_mode => 'force_logical');
 DO $$
-DECLARE g int := (SELECT groupid FROM pg_dist_node WHERE nodeport = {port});
+DECLARE g int := (SELECT groupid FROM pg_dist_node WHERE nodename = '{name}' AND nodeport = {port});
 BEGIN
     FOR i IN 1..60 LOOP
         CALL citus_cleanup_orphaned_resources();
@@ -195,15 +252,21 @@ BEGIN
         PERFORM pg_sleep(1);
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_dist_cleanup WHERE node_group_id = g) THEN
-        RAISE EXCEPTION 'orphaned shards left on :{port}; not removing it';
+        RAISE EXCEPTION 'orphaned shards left on {name}:{port}; not removing it';
     END IF;
 END $$;
-SELECT citus_remove_node('localhost', {port});
+SELECT citus_remove_node('{name}', {port});
 """
 
 
-def remove_worker(cluster: Cluster, port: int) -> None:
-    cluster.admin(REMOVE.format(port=port))
+def remove_worker(cluster: Cluster, key: str) -> None:
+    n, p = key.rsplit(":", 1)
+    cluster.admin(REMOVE.format(name=n, port=int(p)))
+
+
+def add_worker_sql(key: str) -> str:
+    n, p = key.rsplit(":", 1)
+    return "SELECT citus_add_node('%s', %d);" % (n, int(p))
 
 
 def clean_tests(cluster: Cluster) -> None:
