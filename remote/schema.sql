@@ -53,6 +53,16 @@ BEGIN
     END IF;
 END $$;
 
+-- the data plane's datum (slice 3, GherkinIq/Facet/Store/sparql_citus.py): the exact body as given, its media type,
+-- what it was derived from, when it was recorded; and each quad's named graph ('' = the default graph) and language
+ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS raw text;
+ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS media_type text;
+ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS derived_from text[] NOT NULL DEFAULT '{}';
+ALTER TABLE iq.datum ADD COLUMN IF NOT EXISTS recorded text;
+ALTER TABLE iq.quad ADD COLUMN IF NOT EXISTS ng text NOT NULL DEFAULT '';
+ALTER TABLE iq.quad ADD COLUMN IF NOT EXISTS lang text;
+CREATE INDEX IF NOT EXISTS quad_ng ON iq.quad (ng);
+
 CREATE INDEX IF NOT EXISTS datum_words ON iq.datum USING gin (words);
 CREATE INDEX IF NOT EXISTS datum_embedding ON iq.datum USING hnsw (embedding vector_l2_ops);
 CREATE INDEX IF NOT EXISTS quad_po ON iq.quad (p, o);

@@ -153,9 +153,18 @@ conversation.
      coordinator (Citus cannot distribute a view over a foreign table) -- which is where it is read.
    - Not yet: the move scheduled (pg_cron); a month brought back hot; a key scoped to `iq-lake` alone (Vultr's
      subscription key reaches every bucket in it, `iq-blobs` included).
-3. **The plane's adapter.** A `CitusAdapter` for `dataplane.py` (record and graph roles in one), so the conformance
-   suite (`GherkinIq/Facet/Store/features/dataplane.feature`) runs against the cluster; `plane_sparql` via the SQL
-   translation.
+3. **The plane's adapter.** **Built 2026-10-17: the data plane's conformance suite passes on the cluster, 38 of 38**
+   (`GherkinIq/Facet/Store/features/dataplane.feature -D graph=citus`: the same scenarios Oxigraph (36, 2 skipped),
+   AGE (38) and MarkLogic pass; none skipped -- the two Postgres-only ones pass too). `sparql_citus.py`:
+   `CitusRecordAdapter` and `CitusGraphAdapter`, both on the cluster's own tables through the governed write
+   `iq.put_datum`, so a datum's row, its Turtle triples (in the named graph its IRI names, the new `iq.quad.ng`) and
+   its prov:wasDerivedFrom edges (default graph) are one single-shard transaction, held to the shapes at COMMIT; the
+   exact body, media type, derived_from and recorded_at are new `iq.datum` columns. `plane_sparql` is the
+   sparql_age subset (SELECT/ASK, BGP, GRAPH <iri> / ?g, OPTIONAL as LEFT JOIN LATERAL, FILTER = / != / &&,
+   DISTINCT, LIMIT/OFFSET) translated to one SQL query; the rest is refused as `unsupported_sparql`. Each of three
+   breaks is caught (no provenance quads: 2 fail; GRAPH <iri> ignored; OPTIONAL as an inner join). Not yet: the
+   quads a query touches are pulled to the coordinator before the joins (by its constant predicates) -- joins pushed
+   to the workers, and `iq.entail()` behind `plane_sparql` (inference as MarkLogic's rdfs-plus), are slice 4.
 4. **Scoped entailment and scale.** Closure per seed set; load the ProtegeIq vocabulary revisions and a WebScrape
    corpus; measure against MarkLogic's 10-20x query-time cost; pg_search (BM25) on distributed tables.
 5. **Operations.** Park/restore like MarkLogic (snapshot per host), backups (pgBackRest to Blob), and the gate as

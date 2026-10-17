@@ -166,9 +166,10 @@ BEGIN
     END IF;
     DELETE FROM iq.datum d WHERE d.iri = datum;
     INSERT INTO iq.datum (iri, tier, body, embedding) VALUES (datum, tier, body, embedding);
-    INSERT INTO iq.quad (g, s, p, o, lit, dt)
-        SELECT datum, x.s, x.p, x.o, coalesce(x.lit, false), x.dt
-          FROM jsonb_to_recordset(quads) AS x(s text, p text, o text, lit boolean, dt text);
+    INSERT INTO iq.quad (g, s, p, o, lit, dt, ng, lang)
+        SELECT datum, x.s, x.p, x.o, coalesce(x.lit, false), x.dt, coalesce(x.ng, ''), x.lang
+          FROM jsonb_to_recordset(quads) AS x(s text, p text, o text, lit boolean, dt text, ng text, lang text)
+        ON CONFLICT DO NOTHING;
     INSERT INTO iq.shacl_pending (g) VALUES (datum);
 END
 $fn$;
