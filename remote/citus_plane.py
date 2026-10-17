@@ -315,3 +315,33 @@ def timed(fn, *a, **k):
     t0 = time.perf_counter()
     r = fn(*a, **k)
     return r, (time.perf_counter() - t0) * 1000
+
+
+# --- scale: the platform copied K times, each copy its own component -----------------------------------------------
+
+def _scaled(iri: str, i: int) -> str:
+    """An instance IRI of copy i (engines and datums); classes and properties stay shared."""
+    for kind in ("engine:", "datum:"):
+        if iri.startswith(NS + kind):
+            return "%stest:scale-c%d-%s" % (NS, i, iri[len(NS):])
+    return iri
+
+
+def load_copies(cluster: Cluster, k: int, start: int = 0) -> int:
+    """Copies start..k-1 of the platform's datums, bulk-loaded (COPY) beside the original; the vocabulary is shared.
+    Returns the quads written."""
+    pf, n = platform(), 0
+    with cluster.connect() as c:
+        with c.cursor() as cur:
+            with cur.copy("COPY iq.datum (iri, tier, body) FROM STDIN") as cp_:
+                for i in range(start, k):
+                    for iri in pf.datums:
+                        cp_.write_row((_scaled(iri, i), "Silver", json.dumps({"iri": _scaled(iri, i)})))
+            with cur.copy("COPY iq.quad (g, s, p, o, lit, dt) FROM STDIN") as cp_:
+                for i in range(start, k):
+                    for iri, quads in pf.datums.items():
+                        for s, p, o, lit, dt in quads:
+                            cp_.write_row((_scaled(iri, i), _scaled(s, i), p, o if lit else _scaled(o, i), lit, dt))
+                            n += 1
+        c.commit()
+    return n

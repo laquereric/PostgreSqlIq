@@ -165,8 +165,32 @@ conversation.
    breaks is caught (no provenance quads: 2 fail; GRAPH <iri> ignored; OPTIONAL as an inner join). Not yet: the
    quads a query touches are pulled to the coordinator before the joins (by its constant predicates) -- joins pushed
    to the workers, and `iq.entail()` behind `plane_sparql` (inference as MarkLogic's rdfs-plus), are slice 4.
-4. **Scoped entailment and scale.** Closure per seed set; load the ProtegeIq vocabulary revisions and a WebScrape
-   corpus; measure against MarkLogic's 10-20x query-time cost; pg_search (BM25) on distributed tables.
+4. **Scoped entailment and scale.** **Built 2026-10-17** ([`INFERENCE-hosts.md`](INFERENCE-hosts.md),
+   [`SEARCH-hosts.md`](SEARCH-hosts.md)).
+   - **`iq.entail(seeds)`** closes only what is connected to the seeds: the vocabulary in full, the instances of a
+     seed class (typed by it, a subclass or an equivalent, or through a property whose domain or range types into
+     it), then the component of the seeds breadth first -- never through the vocabulary (`rdf:type` into a class,
+     subClassOf and the other T-Box edges), which would join every instance into one component. Every rule's body
+     is joined through shared nodes or the vocabulary, so this is exact for every triple about a node it reaches.
+   - **Checked against the whole closure**: for each competency question's anchor and the class Store on the
+     platform, and for three random copies at each size of a graph of the platform copied 100, 1,000 and 4,000
+     times (1,000 to 40,000 quads): the same triples about every node in scope. **The whole closure grows with the
+     graph (0.79 s, 8.1 s, 36.1 s); the scoped closure stays 45 triples and 0.10-0.13 s at every size: 272x
+     faster at 40,000 quads.**
+   - **`plane_sparql` with inference** (`CitusStore(..., inference=True)`): over the scope the query's IRIs reach,
+     the eight competency questions answer through the plane as on MarkLogic's rdfs-plus, 360-550 ms each over
+     the tunnel (MarkLogic: 414-699 ms); without inference, empty. GRAPH with inference is refused.
+   - **Where a query runs, measured at 200,000 quads**: one triple pattern on the workers (0.29-0.34 s against
+     0.32-0.40 s pulled); a join pulled to the coordinator by its predicates (0.35 s against 4.0 s for Citus's
+     repartition join). That is the default; `pushdown=True` forces the workers. Both give the same answers.
+   - **BM25 on the distributed record** (`deploy-citus.sh search-up`: ParadeDB pg_search 0.26.2 preloaded on
+     every node, a bm25 index on iq.datum built on every shard): a search ranks datums from every worker (151 ms);
+     a datum's text is searchable in the transaction that writes it and by no other until it commits, and goes
+     with a rollback -- MarkLogic's text-in-the-transaction. BM25's statistics are per shard: scores overlap
+     across mention counts (one mention up to 0.85, two from 0.80) and the top ten shares 7 of 10 with one table's.
+   - Breaks caught: the walk stopped at one hop (3 fail), seed classes not expanded, the walk let through the
+     vocabulary (the size is no longer flat); a search's write committed early.
+   - Not yet: the ProtegeIq vocabulary and a WebScrape corpus as real loads; global BM25 statistics.
 5. **Operations.** Park/restore like MarkLogic (snapshot per host), backups (pgBackRest to Blob), and the gate as
    the only writer.
 

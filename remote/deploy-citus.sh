@@ -15,6 +15,7 @@
 #                                 # Storage as its store (lake-vultr); LAKE_STORE=loopback: SeaweedFS on loopback
 #   ./deploy-citus.sh lake-vultr  # the cold tier moved onto Vultr Object Storage (the subscription holding iq-blobs),
 #                                 # in its own bucket iq-lake; the key goes from the API to the coordinator only
+#   ./deploy-citus.sh search-up   # ParadeDB's pg_search (BM25) on every node (service/install-search.sh)
 #   ./deploy-citus.sh status      # every iq-citus instance
 #   ./deploy-citus.sh psql [sql]  # the coordinator as postgres, over ssh (superuser stays on the host)
 #
@@ -249,6 +250,14 @@ BUCKET
   ssh "${SSHO[@]}" "root@$h" "S3_ENDPOINT=$host S3_BUCKET=$bucket S3_KEY_FILE=/root/iq-lake-s3.txt bash -s" < "$here/service/install-lake.sh"
 }
 
+search_up() { # pg_search on every node's host, then the extension (created on the coordinator, propagated)
+  local hosts h
+  hosts=$(jq -r '[.coordinator.host] + [.workers[].host] | unique | .[]' "$STATE/topology.json")
+  for h in $hosts; do ssh "${SSHO[@]}" "root@$h" bash -s < "$here/service/install-search.sh"; done
+  h=$(jq -r .coordinator.host "$STATE/topology.json")
+  ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -v ON_ERROR_STOP=1 -d iq -c 'CREATE EXTENSION IF NOT EXISTS pg_search' -c \"SELECT 'pg_search ' || extversion FROM pg_extension WHERE extname = 'pg_search'\" -At"
+}
+
 lake_up() {
   local h tar
   h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
@@ -294,9 +303,10 @@ case "${1:-}" in
   up|down|status) tunnel; "$1" ;;
   hosts-up|hosts-down|lake-build|lake-build-down) tunnel; f="${1//-/_}"; "$f" ;;
   lake-up) lake_up ;;
+  search-up) search_up ;;
   object-storage) tunnel; object_storage ;;
   lake-vultr) tunnel; lake_vultr ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | lake-vultr | object-storage | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | lake-vultr | search-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
 esac

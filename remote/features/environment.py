@@ -68,6 +68,7 @@ def after_all(context):
 TOPOLOGY = {"single": "a coordinator and two workers on one vc2-2c-4gb, by port (slice 1)",
             "hosts": "a coordinator and two workers on a vc2-2c-4gb each, over a Vultr VPC (slice 2)"}
 TITLE = {"acid": "Citus against MarkLogic's transaction guarantees", "shacl": "SHACL enforced at commit on Citus",
+         "inference": "Scoped inference at query time on Citus", "search": "BM25 over the distributed record",
          "tiered": "Hot Postgres, cold Iceberg on Citus"}
 
 

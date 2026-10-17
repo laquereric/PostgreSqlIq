@@ -15,6 +15,7 @@
 --                            datum (a foreign key checked at COMMIT, so across nodes it is checked by PREPARE)
 --   iq.vocab  (s, p, o)      reference table: the T-Box (subClassOf, domain, ..., owl:*Property types)
 --   iq.entail()              the closure under iq-rdfs-plus.rules (UC_DataPlatform/inference), stated and inferred
+--   iq.entail(seeds)         the same, for what is connected to the seeds only (slice 4)
 
 CREATE SCHEMA IF NOT EXISTS iq;
 
@@ -66,10 +67,12 @@ CREATE INDEX IF NOT EXISTS quad_ng ON iq.quad (ng);
 CREATE INDEX IF NOT EXISTS datum_words ON iq.datum USING gin (words);
 CREATE INDEX IF NOT EXISTS datum_embedding ON iq.datum USING hnsw (embedding vector_l2_ops);
 CREATE INDEX IF NOT EXISTS quad_po ON iq.quad (p, o);
+CREATE INDEX IF NOT EXISTS quad_s ON iq.quad (s);
+CREATE INDEX IF NOT EXISTS quad_o ON iq.quad (o);
 
--- RDFS-Plus to fixpoint, every rule of iq-rdfs-plus.rules as one INSERT ... SELECT over the working closure.
-CREATE OR REPLACE FUNCTION iq.entail()
-RETURNS TABLE (s text, p text, o text, lit boolean, inferred boolean)
+-- RDFS-Plus to fixpoint, every rule of iq-rdfs-plus.rules as one INSERT ... SELECT over the working closure: the
+-- temp table iq_closure, which the caller has loaded (iq.entail: everything; iq.entail(seeds): a scope).
+CREATE OR REPLACE FUNCTION iq.entail_fixpoint() RETURNS int
 LANGUAGE plpgsql AS $fn$
 DECLARE
     a    CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -85,13 +88,11 @@ DECLARE
     ifp  CONSTANT text := 'http://www.w3.org/2002/07/owl#InverseFunctionalProperty';
     sym  CONSTANT text := 'http://www.w3.org/2002/07/owl#SymmetricProperty';
     tra  CONSTANT text := 'http://www.w3.org/2002/07/owl#TransitiveProperty';
-    n bigint; added bigint;
+    n bigint; added bigint; rounds int := 0;
 BEGIN
-    DROP TABLE IF EXISTS pg_temp.iq_closure;
-    CREATE TEMP TABLE iq_closure (s text, p text, o text, lit boolean, inferred boolean,
-                                  PRIMARY KEY (s, p, o, lit)) ON COMMIT DROP;
-    INSERT INTO iq_closure SELECT q.s, q.p, q.o, q.lit, false FROM iq.quad q ON CONFLICT DO NOTHING;
-    INSERT INTO iq_closure SELECT v.s, v.p, v.o, false, false FROM iq.vocab v ON CONFLICT DO NOTHING;
+    CREATE INDEX ON iq_closure (p, o);
+    CREATE INDEX ON iq_closure (o);
+    ANALYZE iq_closure;
     LOOP
         added := 0;
         -- rdfs2 domain
@@ -159,8 +160,101 @@ BEGIN
         INSERT INTO iq_closure SELECT v.o, i.o, v.s, false, true FROM iq_closure i JOIN iq_closure v ON v.p = i.s
             WHERE i.p = inv AND NOT v.lit ON CONFLICT DO NOTHING;
         GET DIAGNOSTICS n = ROW_COUNT; added := added + n;
+        rounds := rounds + 1;
         EXIT WHEN added = 0;
     END LOOP;
+    RETURN rounds;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION iq.closure_table() RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    DROP TABLE IF EXISTS pg_temp.iq_closure;
+    CREATE TEMP TABLE iq_closure (s text, p text, o text, lit boolean, inferred boolean,
+                                  PRIMARY KEY (s, p, o, lit)) ON COMMIT DROP;
+END
+$fn$;
+
+-- the closure of everything: every quad and the vocabulary
+CREATE OR REPLACE FUNCTION iq.entail()
+RETURNS TABLE (s text, p text, o text, lit boolean, inferred boolean)
+LANGUAGE plpgsql AS $fn$
+#variable_conflict use_column
+BEGIN
+    PERFORM iq.closure_table();
+    INSERT INTO iq_closure SELECT q.s, q.p, q.o, q.lit, false FROM iq.quad q ON CONFLICT DO NOTHING;
+    INSERT INTO iq_closure SELECT v.s, v.p, v.o, false, false FROM iq.vocab v ON CONFLICT DO NOTHING;
+    PERFORM iq.entail_fixpoint();
+    RETURN QUERY SELECT c.s, c.p, c.o, c.lit, c.inferred FROM iq_closure c;
+END
+$fn$;
+
+-- The closure of a SCOPE (slice 4): what is connected to the seeds. Every rule's body is joined through shared nodes
+-- or through the vocabulary, so what can be inferred about a node depends only on the triples of its component --
+-- the nodes reachable from it along any triple, either way, except into a class through rdf:type (the class is
+-- vocabulary: every instance of it would otherwise be one component). So: the vocabulary (iq.vocab and any T-Box
+-- triples among the quads) in full; a seed that is a class brings its instances -- typed by it or a subclass or an
+-- equivalent, or the subject (object) of a property whose domain (range) is one of them; then the component of
+-- the seeds, breadth first; then the same fixpoint. Exact for every triple about a node of the scope (checked
+-- against iq.entail() in features/inference.feature), and as costly as the scope, not the graph.
+CREATE OR REPLACE FUNCTION iq.entail(seeds text[])
+RETURNS TABLE (s text, p text, o text, lit boolean, inferred boolean)
+LANGUAGE plpgsql AS $fn$
+#variable_conflict use_column
+DECLARE
+    a    CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    tbox CONSTANT text[] := ARRAY['http://www.w3.org/2000/01/rdf-schema#subClassOf',
+        'http://www.w3.org/2000/01/rdf-schema#subPropertyOf', 'http://www.w3.org/2000/01/rdf-schema#domain',
+        'http://www.w3.org/2000/01/rdf-schema#range', 'http://www.w3.org/2002/07/owl#inverseOf',
+        'http://www.w3.org/2002/07/owl#equivalentClass', 'http://www.w3.org/2002/07/owl#equivalentProperty'];
+    owl  CONSTANT text := 'http://www.w3.org/2002/07/owl#';
+    classes text[]; props text[]; frontier text[]; n int; hops int := 0;
+BEGIN
+    PERFORM iq.closure_table();
+    DROP TABLE IF EXISTS pg_temp.iq_scope;
+    CREATE TEMP TABLE iq_scope (node text PRIMARY KEY) ON COMMIT DROP;
+    -- the vocabulary, in full
+    INSERT INTO iq_closure SELECT v.s, v.p, v.o, false, false FROM iq.vocab v ON CONFLICT DO NOTHING;
+    INSERT INTO iq_closure SELECT q.s, q.p, q.o, q.lit, false FROM iq.quad q
+     WHERE q.p = ANY (tbox) OR (q.p = a AND q.o LIKE owl || '%') ON CONFLICT DO NOTHING;
+    -- classes among the seeds, closed under subClassOf (downwards) and equivalentClass; the properties that type
+    WITH RECURSIVE down(c) AS (
+        SELECT unnest(seeds)
+        UNION
+        SELECT CASE WHEN x.o = d.c THEN x.s ELSE x.o END FROM iq_closure x JOIN down d ON (x.o = d.c OR x.s = d.c)
+         WHERE (x.p = tbox[1] AND x.o = d.c) OR x.p = tbox[6])
+    SELECT array_agg(c) INTO classes FROM down;
+    -- the properties that type into them (domain / range), with every sub-, equivalent and inverse property of those
+    WITH RECURSIVE typing(p) AS (
+        SELECT DISTINCT x.s FROM iq_closure x WHERE x.p IN (tbox[3], tbox[4]) AND x.o = ANY (classes)
+        UNION
+        SELECT CASE WHEN x.o = t.p THEN x.s ELSE x.o END FROM iq_closure x JOIN typing t ON (x.o = t.p OR x.s = t.p)
+         WHERE (x.p = tbox[2] AND x.o = t.p) OR x.p IN (tbox[5], tbox[7]))
+    SELECT array_agg(p) INTO props FROM typing;
+    -- the first frontier: the seeds, the instances of seed classes, the subjects / objects of typing properties
+    INSERT INTO iq_scope SELECT DISTINCT unnest(seeds) ON CONFLICT DO NOTHING;
+    INSERT INTO iq_scope SELECT DISTINCT q.s FROM iq.quad q WHERE q.p = a AND q.o = ANY (classes) ON CONFLICT DO NOTHING;
+    IF props IS NOT NULL THEN
+        INSERT INTO iq_scope SELECT DISTINCT q.s FROM iq.quad q WHERE q.p = ANY (props) ON CONFLICT DO NOTHING;
+        INSERT INTO iq_scope SELECT DISTINCT q.o FROM iq.quad q WHERE q.p = ANY (props) AND NOT q.lit ON CONFLICT DO NOTHING;
+    END IF;
+    frontier := ARRAY(SELECT node FROM iq_scope);
+    -- the component, breadth first (each hop one query across the shards)
+    WHILE cardinality(frontier) > 0 LOOP
+        hops := hops + 1;
+        INSERT INTO iq_closure SELECT q.s, q.p, q.o, q.lit, false FROM iq.quad q
+         WHERE (q.s = ANY (frontier) OR (q.o = ANY (frontier) AND NOT q.lit)) AND q.p <> ALL (tbox) ON CONFLICT DO NOTHING;
+        WITH reached AS (
+            SELECT x.s AS node FROM iq_closure x WHERE x.o = ANY (frontier) AND NOT x.lit AND NOT x.inferred
+               AND x.p <> ALL (tbox)
+            UNION SELECT x.o FROM iq_closure x WHERE x.s = ANY (frontier) AND NOT x.lit AND x.p <> a AND NOT x.inferred
+               AND x.p <> ALL (tbox)),
+        fresh AS (INSERT INTO iq_scope SELECT r.node FROM reached r ON CONFLICT DO NOTHING RETURNING node)
+        SELECT array_agg(node) INTO frontier FROM fresh;
+        frontier := coalesce(frontier, '{}');
+    END LOOP;
+    PERFORM set_config('iq.scope_hops', hops::text, true);
+    PERFORM iq.entail_fixpoint();
     RETURN QUERY SELECT c.s, c.p, c.o, c.lit, c.inferred FROM iq_closure c;
 END
 $fn$;
@@ -168,4 +262,4 @@ $fn$;
 -- iq reads and writes; the schema is postgres's (applied over ssh), so no DDL is in the client's reach
 GRANT USAGE ON SCHEMA iq TO iq;
 GRANT SELECT, INSERT, UPDATE, DELETE ON iq.datum, iq.quad, iq.vocab TO iq;
-GRANT EXECUTE ON FUNCTION iq.entail() TO iq;
+GRANT EXECUTE ON FUNCTION iq.entail(), iq.entail(text[]), iq.entail_fixpoint(), iq.closure_table() TO iq;
