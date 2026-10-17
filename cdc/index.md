@@ -48,6 +48,19 @@ Kafka" at Sequin, but IQ already has the destination: the [[UC_LaptopCloudBridge
   the slot.
 - **A rotated token does not stop it.** Each probe tries `$IQ_HARNESS_SESSION`, then re-reads
   `~/.iq/harness-token`, and the cycle ships with the first credential `/whoami` accepts.
+- **The lag, on the Dashboard (slice 3).** `cdc.lag()` reads `pg_replication_slots` only (never the slot, so a
+  running streamer is not disturbed) and reports:
+  - `behind`: WAL written since the slot's position. Each cycle now peeks up to the WAL flush position, and when
+    that read reaches it with everything acknowledged, it moves the slot there. So an idle box shows no lag, and
+    `behind` is genuinely unshipped.
+  - `held`: WAL kept for the slot, against the cap and `safe_wal_size`.
+  - the snapshot, and the last cycle (`~/.iq/cdc/cycle.json`: when, server up or down, sent).
+  - a health word: `ok`, `behind` (WAL unshipped and no cycle in 5 minutes), `snapshot incomplete`, `at risk`
+    (unreserved, or over half the cap), `lost`, or `no slot`.
+
+  The Dashboard's Agents tab shows it as a `cdc` leaf beside the cost meter (green when ok, red when it needs a
+  hand), with a detail panel (`UC_Dashboard/tabs/agents`: `cdc_lag()`, loaded under its own module name).
+  `iq-cdc.sh status` prints the same health.
 - **Never autostarted.** There is no launchd job and no app hook. A scenario checks that nothing under UC_App,
   DeployIq, scripts or any plist names it.
 
@@ -86,13 +99,16 @@ rows), and finished (`2444:2444:` at 0/20643A8).
 - After `pg_ctl restart`, pgembed's handle no longer knows the postmaster, so its cleanup leaves it running. The
   scenarios stop it by its data directory.
 
-`features/cdc.feature`: 26 scenarios, all passing in about 2 s (12 for the stream, 7 for the snapshot plus 8
-xid-visibility examples, 1 for credentials), on a scratch pgembed cluster with the relay
+`features/cdc.feature`: 29 scenarios, all passing in about 2 s (12 for the stream, 7 for the snapshot plus 8
+xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value), on a scratch pgembed cluster with the relay
 in-process (nothing reaches the IQ Server):
 
     /Applications/IQ.app/Contents/Resources/python/bin/python3 -m behave features
 
+Lag live (2026-10-17): before a cycle under the new code, the Dashboard read `behind`, 6.7 MB. After one
+`iq-cdc.sh once` it read `ok`, 8 kB behind. The panel was rendered in the IQ app's Dashboard card (pointed at a
+scratch dashboard on :8031, then back to :8030).
+
 **Limits.** In a table with no primary key, identical rows have the same content and so one snapshot record.
 
-**Next.** A table filter by
-publication row filter rather than whole tables; the slot's lag on the Dashboard.
+**Next.** A table filter by publication row filter rather than whole tables.

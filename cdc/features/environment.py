@@ -12,6 +12,7 @@ from pathlib import Path
 
 UC = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(UC))
+sys.path.insert(0, str(UC.parent / "UC_LaptopCloudBridge"))   # the steps build the relay and identity map
 
 import cdc  # noqa: E402
 

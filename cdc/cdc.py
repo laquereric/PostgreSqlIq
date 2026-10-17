@@ -51,12 +51,16 @@ import time
 from datetime import datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_BRIDGE = os.path.join(_HERE, "..", "UC_LaptopCloudBridge")
-if _BRIDGE not in sys.path:
-    sys.path.insert(0, os.path.abspath(_BRIDGE))
+_BRIDGE = os.path.abspath(os.path.join(_HERE, "..", "UC_LaptopCloudBridge"))
 
-import flush as _flush          # noqa: E402  (the bridge's de-identification)
-import relay as _relay          # noqa: E402  (canonical keys + the HTTP transport)
+
+def _bridge(name: str):
+    """A UC_LaptopCloudBridge module (flush: de-identification; relay: canonical keys + the HTTP transport; the
+    identity map's client), loaded when first needed -- reading the lag (the Dashboard) never loads them."""
+    if _BRIDGE not in sys.path:
+        sys.path.insert(0, _BRIDGE)
+    import importlib
+    return importlib.import_module(name)
 
 SLOT = "iq_cdc"
 PUBLICATION = "iq_cdc"
@@ -269,14 +273,14 @@ def status(d: str) -> dict:
                         (PUBLICATION,)).fetchone()
         s = c.execute("select active, confirmed_flush_lsn::text, wal_status, "
                       "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
-                      "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint "
+                      "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint, safe_wal_size "
                       "from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone()
     out = {"wal_level": level, "wal_cap": cap, "publication": None, "slot": None}
     if pub:
         out["publication"] = {"schemas": pub[1] or [], "tables": pub[2] or []}
     if s:
         out["slot"] = {"active": s[0], "confirmed": s[1], "wal_status": s[2], "retained_bytes": s[3],
-                       "behind_bytes": s[4]}
+                       "behind_bytes": s[4], "safe_wal_bytes": s[5]}
     return out
 
 
@@ -292,11 +296,16 @@ def system_id(c) -> str:
     return str(c.execute("select system_identifier from pg_control_system()").fetchone()[0])
 
 
-def peek(c, limit: int = 1000):
-    """The slot's next whole transactions, not consumed: [(lsn, xid, bytes)]."""
+def peek(c, limit: int = 1000, upto: str = None):
+    """The slot's next whole transactions, not consumed: [(lsn, xid, bytes)]. With `upto`, decoding stops there; a
+    read returning fewer than `limit` rows decoded everything up to it."""
     return c.execute("select lsn::text, xid::text, data from pg_logical_slot_peek_binary_changes"
-                     "(%s, NULL, %s, 'proto_version', '1', 'publication_names', %s)",
-                     (SLOT, limit, PUBLICATION)).fetchall()
+                     "(%s, %s::pg_lsn, %s, 'proto_version', '1', 'publication_names', %s)",
+                     (SLOT, upto, limit, PUBLICATION)).fetchall()
+
+
+def flushed(c) -> str:
+    return c.execute("select pg_current_wal_flush_lsn()::text").fetchone()[0]
 
 
 def advance(c, lsn: str):
@@ -318,7 +327,7 @@ class Deidentifier:
 
     def __init__(self, idmap):
         self.idmap = idmap
-        self._f = _flush.Flusher(None, idmap, None)
+        self._f = _bridge("flush").Flusher(None, idmap, None)
 
     def __call__(self, rec: dict) -> dict:
         return self._emails(self._f.de_identify(rec))
@@ -363,6 +372,13 @@ class Streamer:
         self.sysid = system_id(conn)
 
     def cycle(self) -> dict:
+        out = self._cycle()
+        if self.state:                          # the last cycle, for the lag's reader (the Dashboard)
+            write_state(os.path.join(os.path.dirname(self.state), "cycle.json"),
+                        dict(out, at=datetime.now(timezone.utc).isoformat()))
+        return out
+
+    def _cycle(self) -> dict:
         ok, http = self.up()
         if not ok:
             return {"server": "down", "http": http, "sent": 0, "already": 0, "advanced": None}
@@ -371,7 +387,9 @@ class Streamer:
             return {"server": "up", "http": http, "sent": 0, "already": 0, "advanced": None,
                     "paused": "snapshot incomplete -- run: iq-cdc.sh snapshot"}
         seen = snap.get("snapshot") if snap.get("status") == "done" else None
-        rows = peek(self.c, self.limit)
+        upto = flushed(self.c)
+        rows = peek(self.c, self.limit, upto)
+        whole = len(rows) < self.limit           # decoded everything up to `upto`
         dec, txns, skipped = Decoder(), [], 0    # [(end_lsn, [records])]
         for lsn, _xid, data in rows:
             got = dec.feed(lsn, data)
@@ -388,6 +406,9 @@ class Streamer:
         if skipped:
             out["in_snapshot"] = skipped
         if not txns:
+            if whole:                           # nothing published up to `upto`: the slot may stand there
+                advance(self.c, upto)
+                out["advanced"] = upto
             return out
         try:
             flat = [(end, self.deid(r)) for end, recs in txns for r in recs]
@@ -404,6 +425,8 @@ class Streamer:
         except Exception as e:                  # refused or gone mid-cycle: keep what was acked
             out["error"] = str(e)
         safe = self.safe_end(txns, todo, sent)
+        if whole and sent >= len(todo) and not out.get("error"):
+            safe = upto                         # every transaction up to `upto` is held: stand at `upto`
         if safe:
             advance(self.c, safe)
             out["advanced"] = safe
@@ -425,9 +448,51 @@ class Streamer:
 
 def missing(transport, flat):
     """Ask the server which of these (end, record) it holds: (the rest, how many it had)."""
-    keys = [_relay.key_for(r) for _, r in flat]
+    keys = [_bridge("relay").key_for(r) for _, r in flat]
     have = set(transport.have(keys)) if keys else set()
     return [(e, r) for (e, r), k in zip(flat, keys) if k not in have], sum(k in have for k in keys)
+
+
+# -- the lag ----------------------------------------------------------------------------------------------
+def _bytes(cap: str):
+    """max_slot_wal_keep_size as bytes ('1GB', '512MB', '-1' -> None)."""
+    m = re.fullmatch(r"(\d+)\s*([kMGT]?B)?", cap or "")
+    if not m or cap.startswith("-"):
+        return None
+    return int(m.group(1)) * {"kB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40}.get(m.group(2) or "MB", 1)
+
+
+def lag(d: str, state: str = "") -> dict:
+    """How far the IQ Server is behind the box, read without touching the slot (a running streamer holds it):
+    the WAL written since the slot's position (`behind_bytes`: unshipped, since an idle cycle moves the slot to the
+    WAL's end), the WAL the slot holds against its cap, the snapshot, and the last cycle (when, server up or down).
+    `health`: no slot | lost | at risk (unreserved, or over half the cap) | snapshot incomplete | behind (WAL
+    unshipped and no cycle in 5 minutes) | ok."""
+    st = status(d)
+    snap = read_state(state) if state else {}
+    last = read_state(os.path.join(os.path.dirname(state), "cycle.json")) if state else {}
+    cap = _bytes(st["wal_cap"])
+    out = {"slot": st["slot"], "wal_level": st["wal_level"], "wal_cap": st["wal_cap"], "cap_bytes": cap,
+           "tables": (st["publication"] or {}).get("tables", []),
+           "snapshot": {k: v for k, v in snap.items() if k != "tables"} or None, "last_cycle": last or None}
+    s = st["slot"]
+    age = None
+    if last.get("at"):
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(last["at"])).total_seconds()
+    out["last_cycle_age_s"] = None if age is None else round(age)
+    if not s:
+        out["health"] = "no slot"
+    elif s["wal_status"] == "lost":
+        out["health"] = "lost"
+    elif s["wal_status"] == "unreserved" or (cap and s["retained_bytes"] > cap / 2):
+        out["health"] = "at risk"
+    elif snap.get("status") == "running":
+        out["health"] = "snapshot incomplete"
+    elif s["behind_bytes"] > 0 and (age is None or age > 300):
+        out["health"] = "behind"
+    else:
+        out["health"] = "ok"
+    return out
 
 
 # -- the initial snapshot ---------------------------------------------------------------------------------
@@ -615,13 +680,14 @@ def main(argv=None) -> int:
     if a.cmd == "status":
         st = status(d)
         st["server"] = {"base": base, "up": PairedProbe(base)()[0]}
-        st["snapshot"] = {k: v for k, v in read_state(state_path()).items() if k != "tables"} or None
+        lg = lag(d, state_path())
+        st.update(snapshot=lg["snapshot"], last_cycle=lg["last_cycle"], health=lg["health"])
         print(json.dumps(st, indent=2))
         return 0
     if not creds:
         print("[iq-cdc] no credential paired (~/.iq/harness-token or IQ_HARNESS_SESSION) -- run iq-login first")
         return 2
-    import identity_map
+    identity_map = _bridge("identity_map")
     st = status(d)
     if not st["slot"]:
         print("[iq-cdc] no slot %s -- run: iq-cdc.sh setup" % SLOT)
@@ -631,7 +697,7 @@ def main(argv=None) -> int:
         return 2
     with _connect(d) as c:
         tokenizer = identity_map.RemoteTokenizer(base, bearer=creds[0])
-        transport = _relay.HttpRelayTransport(base, bearer=creds[0])
+        transport = _bridge("relay").HttpRelayTransport(base, bearer=creds[0])
         st = Streamer(c, up=PairedProbe(base, tokenizer, transport), deid=Deidentifier(tokenizer),
                       transport=transport, host=os.uname().nodename,
                       state=state_path())

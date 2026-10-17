@@ -174,3 +174,34 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     Given the environment holds an expired token and the paired file a live one
     When the server is probed
     Then it is up, and the transport and the tokenizer carry the file's token
+
+  Scenario: An idle cycle stands the slot at the WAL's end, so behind means unshipped
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When a table outside the publication takes 500 rows
+    And the streamer runs one cycle
+    Then the cycle advanced with nothing to send
+    And the lag is ok and behind by less than 1 kB
+
+  Scenario: The lag names what needs a hand
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When note 40 is inserted
+    And no cycle has run for 10 minutes
+    Then the lag says behind
+    When the streamer runs one cycle
+    Then the lag is ok and behind by less than 1 kB
+    And the lag's last cycle saw the server up and sent 1
+    When the snapshot is left running
+    Then the lag says snapshot incomplete
+    When the snapshot runs
+    Then the lag is at risk once the slot may hold only 1MB and a table outside the publication takes 20000 rows
+    When CDC is torn down
+    Then the lag says no slot
+
+  Scenario: The Dashboard's Agents tab shows the same lag
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When note 41 is inserted
+    And the streamer runs one cycle
+    Then the Agents tab's cdc value has the slot, the health and the last cycle

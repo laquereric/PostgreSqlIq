@@ -467,3 +467,77 @@ def _probe(context):
 def _carry(context):
     assert context.probed == (True, 200), context.probed
     assert all(c.headers["Authorization"] == "Bearer live-token" for c in context.clients)
+
+
+# -- the lag -----------------------------------------------------------------------------------------------
+@when("a table outside the publication takes {n:d} rows")
+def _unpublished(context, n):
+    _sql(context, "CREATE SCHEMA IF NOT EXISTS private")
+    _sql(context, "CREATE TABLE IF NOT EXISTS private.scratch (id serial PRIMARY KEY, pad text)")
+    _sql(context, "INSERT INTO private.scratch (pad) SELECT repeat('x', 100) FROM generate_series(1, %s)" % n)
+
+
+@then("the cycle advanced with nothing to send")
+def _idle_advanced(context):
+    assert context.out["advanced"] and context.out["transactions"] == 0 and context.out["sent"] == 0, context.out
+
+
+def _lag(context):
+    return cdc.lag(context.dsn, context.state)
+
+
+@then("the lag is ok and behind by less than 1 kB")
+def _lag_ok(context):
+    lg = _lag(context)
+    assert lg["health"] == "ok" and lg["slot"]["behind_bytes"] < 1024, lg
+
+
+@when("no cycle has run for {m:d} minutes")
+def _stale(context, m):
+    from datetime import datetime, timedelta, timezone
+    cdc.write_state(os.path.join(os.path.dirname(context.state), "cycle.json"),
+                    {"server": "up", "sent": 0, "at": (datetime.now(timezone.utc) - timedelta(minutes=m)).isoformat()})
+
+
+@then("the lag says {health}")
+def _lag_is(context, health):
+    lg = _lag(context)
+    assert lg["health"] == health, lg
+
+
+@then("the lag's last cycle saw the server up and sent {n:d}")
+def _lag_last(context, n):
+    lg = _lag(context)
+    assert lg["last_cycle"]["server"] == "up" and lg["last_cycle"]["sent"] == n and lg["last_cycle_age_s"] < 60, lg
+
+
+@when("the snapshot is left running")
+def _left_running(context):
+    cdc.write_state(context.state, {"status": "running", "started": "now"})
+
+
+@then("the lag is at risk once the slot may hold only 1MB and a table outside the publication takes {n:d} rows")
+def _small_cap(context, n):
+    _sql(context, "ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+    _sql(context, "select pg_reload_conf()")
+    try:
+        _unpublished(context, n)
+        context.at_risk = _lag(context)
+    finally:
+        _sql(context, "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'")
+        _sql(context, "select pg_reload_conf()")
+    assert context.at_risk["health"] == "at risk", context.at_risk
+    context.server.up = True
+
+
+@then("the Agents tab's cdc value has the slot, the health and the last cycle")
+def _agents_tab(context):
+    import importlib.util
+    path = context.uc.parent / "UC_Dashboard" / "tabs" / "agents" / "agents.py"
+    spec = importlib.util.spec_from_file_location("iq_agents_tab", path)
+    tab = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tab)
+    got = tab.cdc_lag(dsn=context.dsn, state=context.state)
+    want = _lag(context)
+    assert got["health"] == want["health"] == "ok", got
+    assert got["slot"]["confirmed"] == want["slot"]["confirmed"] and got["last_cycle"]["sent"] == 1, got
