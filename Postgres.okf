@@ -27,7 +27,7 @@ pg_textsearch (see Ecosystem). Postgres is used, but almost none of its ecosyste
 | Registry / Encounter (UC_IntentionalQuality.Com) | `accounts`, `registrations`, `suggestions` | `Sites/intentional-quality-com/muse/encounter.py:80-83` |
 | Identity / IAM (UC_IdentityAndAccess) | `access_tokens`; `identity_map` (token → `subject_iri`) | `Sites/memory-intentionalquality-com/token_store.py:25`, `identity_store.py:32` |
 | UC_WebScrape | `scrape_docs`, `scrape_builds`, `scrape_aliases` (tsvector + GIN for text) | `UC_WebScrape/index.py:36-52` |
-| Decision Objects / CpCp gate (UC_Wasm3) | `cpcp_operations` (jsonb `decision`, `observation`): durable replay | `DeployIq/crates/cpcp-seam/src/gate.rs:212` |
+| use records / CpCp gate (UC_Wasm3) | `cpcp_operations` (jsonb `decision`, `observation`): durable replay | `DeployIq/crates/cpcp-seam/src/gate.rs:212` |
 | UC_OntologyPipeline | `{schema}.onto_cases`, `{schema}.onto_adoptions` | `grounding_live.py:47-50` |
 
 Readers include the Python services (psycopg), the Rust gate (`postgres` crate) and, once an hour, the MotherDuck
