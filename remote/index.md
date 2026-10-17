@@ -120,6 +120,35 @@ conversation.
    - Not yet: a focus node is held to its own datum's triples (the plane's one-datum-per-subject rule); `drop_datum`
      does not recheck datums that point at the dropped one with `sh:class`; `iq` itself still has direct DML (only
      `iq_agent` is held to the governed path) until the gate is the only writer (slice 5).
+2c. **Hot Postgres, cold Iceberg** (from `UC_Postgres/TieredIceberg,md`). The ColdFront / PGAA pattern built from
+   [pg_lake](https://github.com/Snowflake-Labs/pg_lake) (Apache-2.0) on the coordinator: `iq.event` is the hot tier
+   (distributed, co-located with `iq.datum`, a partition a month), `iq.event_cold` the cold tier (an Iceberg table;
+   pg_lake keeps the Iceberg catalog in Postgres, so a write to it commits or rolls back with the transaction),
+   `iq.event_all` both as one -- to read, and to write (a late row for a month already moved goes to Iceberg) --
+   and `iq.tier_out(t)` moves every month that ended before `t` in ONE transaction (copy into Iceberg, drop the
+   partition). `deploy-citus.sh lake-build` compiles pg_lake (DuckDB, the Azure SDK) for PG17/el9 on a throwaway
+   vc2-6c-16gb and keeps only the packed result; `lake-up` installs it with `pgduck_server` (unix socket only) and
+   an S3 store. **The store is SeaweedFS on the coordinator's loopback** (MinIO's community binaries are withdrawn,
+   HTTP 410): writing the test's cold tier into `iq-blobs` would be a production write with production keys, so a
+   real bucket is `S3_ENDPOINT=... S3_BUCKET=... S3_KEY_FILE=...` once one is chosen. `features/tiered.feature`
+   (6 scenarios; skipped on a cluster without the cold tier). **Built 2026-10-17: all 6 pass on the VPC cluster**
+   ([`TIERED-hosts.md`](TIERED-hosts.md)), pg_lake 3.5.7 preloaded beside Citus 14.2 on PostgreSQL 17.11:
+   - an Iceberg write rolls back and commits with Postgres; its files on the store are Iceberg (metadata JSON,
+     Avro manifests, Parquet);
+   - moving two months (1,000 events) to Iceberg takes 0.7 s in one transaction, and the events by month and a
+     checksum over every event are unchanged; a move failing after the copy leaves every month hot and Iceberg
+     without them;
+   - a reader counting both tiers through the move sees 2,000 every time (24 reads); with the move split into two
+     transactions it sees the rows twice -- caught;
+   - a late event for a month already in Iceberg is written to Iceberg through `iq.event_all`;
+   - DuckDB, reading the Iceberg metadata straight from the store (`iceberg_scan`, no Postgres), counts the same
+     1,000 cold events: the cold tier is open files, readable by DuckDB / MotherDuck as the lake.
+   - Each of three breaks is caught (drop without copy: 3 fail; the move as two transactions; late writes always
+     hot).
+   - Found: pg_lake checks the Iceberg location is empty even on `CREATE TABLE IF NOT EXISTS` of a table that
+     exists; the PGDG build needs `with_llvm=no` (no clang) and `krb5-devel`; and the union view is local to the
+     coordinator (Citus cannot distribute a view over a foreign table) -- which is where it is read.
+   - Not yet: a real bucket (the cold tier is on loopback); the move scheduled (pg_cron); a month brought back hot.
 3. **The plane's adapter.** A `CitusAdapter` for `dataplane.py` (record and graph roles in one), so the conformance
    suite (`GherkinIq/Facet/Store/features/dataplane.feature`) runs against the cluster; `plane_sparql` via the SQL
    translation.

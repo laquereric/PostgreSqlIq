@@ -9,6 +9,10 @@
 #   ./deploy-citus.sh hosts-up    # slice 2: a VPC and four instances -- coordinator, w1, w2 and a spare w3 --
 #                                 # one node each, the nodes talking over the VPC's private addresses only
 #   ./deploy-citus.sh hosts-down  # destroy the four and the VPC
+#   ./deploy-citus.sh lake-build  # pg_lake for PG17/el9, built on a throwaway vc2-6c-16gb (iq-citus-build), packed into
+#                                 # ~/.iq/citus/pg_lake-<tag>-pg17-el9.tar.gz; the box is destroyed after
+#   ./deploy-citus.sh lake-up     # the cold tier on the coordinator: that build, pgduck_server, an S3 store
+#                                 # (service/install-lake.sh; SeaweedFS on loopback unless S3_ENDPOINT is given)
 #   ./deploy-citus.sh status      # every iq-citus instance
 #   ./deploy-citus.sh psql [sql]  # the coordinator as postgres, over ssh (superuser stays on the host)
 #
@@ -175,6 +179,51 @@ hosts_down() {
   return 0
 }
 
+lake_build() {
+  local os_id fw_id id ip st label="$LABEL-build" tag="${PG_LAKE_TAG:-v3.5.7}"
+  local out="$STATE/pg_lake-$tag-pg17-el9.tar.gz"
+  [ -s "$out" ] && { say "already built: $out"; return 0; }
+  os_id=$(api GET '/os?per_page=500' | jq -r '.os[] | select(.name|test("^Rocky Linux 9 x64")) | .id' | head -1)
+  fw_id=$(firewall)
+  id=$(by_label "$label")
+  [ -n "$id" ] || id=$(api POST /instances "$(jq -n --arg r "$REGION" --arg p "${BUILD_PLAN:-vc2-6c-16gb}" --argjson o "$os_id" \
+      --arg l "$label" --arg k "$SSH_KEY_ID" --arg f "$fw_id" \
+      '{region:$r,plan:$p,os_id:$o,label:$l,hostname:$l,sshkey_id:[$k],firewall_group_id:$f,backups:"disabled"}')" | jq -r .instance.id)
+  for _ in $(seq 1 90); do
+    read -r st ip < <(api GET "/instances/$id" | jq -r '.instance | "\(.status) \(.main_ip)"')
+    [ "$st" = active ] && [ "$ip" != 0.0.0.0 ] && break; sleep 10
+  done
+  ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+  wait_ssh "$ip" || { say "no ssh to $label $ip"; exit 1; }
+  say "building pg_lake $tag on $label ($ip); log: ssh root@$ip tail -f /root/build-pg-lake.log"
+  scp -q "${SSHO[@]}" "$here/service/build-pg-lake.sh" "root@$ip:/root/build-pg-lake.sh"   # on disk: the build outlives ssh
+  ssh "${SSHO[@]}" "root@$ip" "[ -f /root/build-pg-lake.done ] || systemctl is-active -q iq-build-pg-lake || \
+    systemd-run -q --unit=iq-build-pg-lake --setenv=PG_LAKE_TAG=$tag --setenv=HOME=/root bash /root/build-pg-lake.sh"
+  local done=""
+  for _ in $(seq 1 360); do   # up to 3 h
+    done=$(ssh "${SSHO[@]}" "root@$ip" 'cat /root/build-pg-lake.done 2>/dev/null' || true)
+    [ -n "$done" ] && break; sleep 30
+  done
+  ssh "${SSHO[@]}" "root@$ip" 'tail -n 5 /root/build-pg-lake.log'
+  if [ "$done" = ok ]; then
+    scp -q "${SSHO[@]}" "root@$ip:/root/pg_lake-$tag-pg17-el9.tar.gz" "$out"
+    api DELETE "/instances/$id" >/dev/null; say "fetched $out; destroyed $label"
+  else
+    say "build ${done:-timed out}; $label ($ip) kept for a look -- deploy-citus.sh lake-build-down destroys it"; exit 1
+  fi
+}
+
+lake_build_down() { local id; id=$(by_label "$LABEL-build"); [ -n "$id" ] && api DELETE "/instances/$id" >/dev/null && say "destroyed $LABEL-build"; return 0; }
+
+lake_up() {
+  local h tar
+  h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
+  tar=$(ls -t "$STATE"/pg_lake-*-pg17-el9.tar.gz 2>/dev/null | head -1)
+  [ -n "$tar" ] || { echo "no pg_lake build: $0 lake-build" >&2; exit 1; }
+  scp -q "${SSHO[@]}" "$tar" "root@$h:/root/"
+  ssh "${SSHO[@]}" "root@$h" bash -s < "$here/service/install-lake.sh"
+}
+
 up() {
   local i ip
   i=$(instance)
@@ -205,8 +254,9 @@ status() {
 
 case "${1:-}" in
   up|down|status) tunnel; "$1" ;;
-  hosts-up|hosts-down) tunnel; "${1/-/_}" ;;
+  hosts-up|hosts-down|lake-build|lake-build-down) tunnel; f="${1//-/_}"; "$f" ;;
+  lake-up) lake_up ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | status | psql [sql]" >&2; exit 2 ;;
 esac

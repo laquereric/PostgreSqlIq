@@ -30,6 +30,12 @@ def before_all(context):
                                      "current_setting('server_version')").fetchone()
 
 
+def before_feature(context, feature):
+    if "lake" in feature.tags and context.cluster.admin(
+            "SELECT count(*) FROM pg_extension WHERE extname = 'pg_lake_table'") != "1":
+        feature.skip("no cold tier on this cluster (deploy-citus.sh lake-up)")
+
+
 def after_scenario(context, scenario):
     for c in getattr(context, "open_conns", []):
         try:
@@ -43,6 +49,8 @@ def after_scenario(context, scenario):
             context.cluster.admin(UNHOLD)
     finally:
         cp.clean_tests(context.cluster)
+    if "lake" in scenario.feature.tags:
+        context.cluster.admin("DELETE FROM iq.event_cold")
     context.outcomes.append((scenario.name, scenario.status.name))
 
 
@@ -59,11 +67,12 @@ def after_all(context):
 
 TOPOLOGY = {"single": "a coordinator and two workers on one vc2-2c-4gb, by port (slice 1)",
             "hosts": "a coordinator and two workers on a vc2-2c-4gb each, over a Vultr VPC (slice 2)"}
-TITLE = {"acid": "Citus against MarkLogic's transaction guarantees", "shacl": "SHACL enforced at commit on Citus"}
+TITLE = {"acid": "Citus against MarkLogic's transaction guarantees", "shacl": "SHACL enforced at commit on Citus",
+         "tiered": "Hot Postgres, cold Iceberg on Citus"}
 
 
 def _report(context, feature):
-    if not hasattr(context, "cluster"):
+    if not hasattr(context, "cluster") or not context.outcomes:      # nothing ran (a skipped feature)
         return
     citus, vector, pg = context.versions
     m = context.measures
