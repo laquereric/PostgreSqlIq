@@ -43,6 +43,7 @@ PREFIXES = {"iq": NS, "rdf": RDF, "rdfs": RDFS, "owl": OWL, "prov": "http://www.
 TBOX = {RDFS + "subClassOf", RDFS + "subPropertyOf", RDFS + "domain", RDFS + "range", OWL + "inverseOf",
         OWL + "equivalentClass", OWL + "equivalentProperty"}
 TEST = NS + "test:"
+XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
 SSHO = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
 PG = "/usr/pgsql-17/bin"
 COORD = "coordinator"
@@ -95,6 +96,7 @@ class Cluster:
                         "-L", "127.0.0.1:%d:127.0.0.1:5432" % c.port, "root@" + c.host], check=True)
         c.password = c.host_sh("cut -d: -f2- /root/citus-iq.txt").strip()
         c.admin((HERE / "schema.sql").read_text())
+        c.admin((HERE / "shacl.sql").read_text())
         return c
 
     def close(self) -> None:
@@ -177,7 +179,7 @@ def short(v: str) -> str:
 @dataclass
 class Platform:
     vocab: list          # (s, p, o) for iq.vocab
-    datums: dict         # subject iri -> [(s, p, o, lit)]
+    datums: dict         # subject iri -> [(s, p, o, lit, datatype)]
 
 
 def platform() -> Platform:
@@ -192,7 +194,7 @@ def platform() -> Platform:
         if p in TBOX or (p == RDF + "type" and o.startswith(OWL)):
             vocab.append((s, p, o))
         else:
-            datums.setdefault(s, []).append((s, p, o, lit))
+            datums.setdefault(s, []).append((s, p, o, lit, t.object.datatype.value if lit else None))
     return Platform(vocab, datums)
 
 
@@ -202,15 +204,14 @@ def embedding(iri: str) -> list:
 
 
 def put(c, iri: str, quads: list, tier: str = "Silver", body: dict | None = None, emb: list | None = None) -> None:
-    """One datum in the caller's transaction: its row (document, text, vector) and its triples, replaced whole."""
+    """One datum in the caller's transaction, through the governed write (iq.put_datum): its row (document, text,
+    vector) and its triples, replaced whole, and held to the shapes at COMMIT. A triple is (s, p, o, lit[, dt])."""
     body = body if body is not None else {"iri": iri, "label": short(iri),
                                           "text": " ".join(short(q[2]) for q in quads if not q[3])}
-    c.execute("DELETE FROM iq.datum WHERE iri = %s", (iri,))
-    c.execute("INSERT INTO iq.datum (iri, tier, body, embedding) VALUES (%s, %s, %s, %s::vector)",
-              (iri, tier, json.dumps(body), str(emb or embedding(iri))))
-    with c.cursor() as cur:
-        cur.executemany("INSERT INTO iq.quad (g, s, p, o, lit) VALUES (%s, %s, %s, %s, %s)",
-                        [(iri, *q) for q in quads])
+    rows = [{"s": q[0], "p": q[1], "o": q[2], "lit": q[3],
+             "dt": (q[4] if len(q) > 4 else None) or (XSD_STRING if q[3] else None)} for q in quads]
+    c.execute("SELECT iq.put_datum(%s, %s, %s, %s::vector, %s)",
+              (iri, tier, json.dumps(body), str(emb or embedding(iri)), json.dumps(rows)))
 
 
 def load_platform(cluster: Cluster) -> Platform:
@@ -271,6 +272,8 @@ def add_worker_sql(key: str) -> str:
 
 def clean_tests(cluster: Cluster) -> None:
     with cluster.connect() as c:
+        for t in ("shape_target", "shape_property", "shape_closed"):
+            c.execute("DELETE FROM iq.%s WHERE graph LIKE %%s" % t, (TEST + "%",))
         c.execute("DELETE FROM iq.datum WHERE iri LIKE %s", (TEST + "%",))
         c.execute("DELETE FROM iq.vocab WHERE s LIKE %s", (TEST + "%",))
         c.commit()

@@ -91,6 +91,35 @@ conversation.
      worker already in the cluster ("operation is not allowed on this node").
    The fork [laquereric/citus](https://github.com/laquereric/citus) (2026-10-17) is where the
    `citus_remove_node` cleanup fix would go; the cluster still runs the packaged 14.2.
+2b. **SHACL at commit** (from `UC_Postgres/SHACL.md`). **Built 2026-10-17: 15 scenarios pass on both topologies**
+   ([`SHACL-hosts.md`](SHACL-hosts.md)). GraphDB checks each transaction against the shapes at commit and refuses
+   what violates them; Postgres has no SHACL engine (pgRDF's -- forked as
+   [laquereric/pgRDF](https://github.com/laquereric/pgRDF) -- is a stub until its 0.4). So: **shapes compiled to
+   SQL, checked when the transaction commits.** `shacl.py` compiles IQ's own LinkML-derived shapes
+   (`GherkinIq/Facet/*/derived/*.shacl.ttl`) into rows of three reference tables, refusing by name any SHACL outside
+   the supported Core subset (targetClass with subclasses, min/maxCount, datatype, nodeKind, class, in, pattern,
+   min/maxInclusive, closed). `shacl.sql` adds `iq.put_datum()`, the governed write (the plane's `put` now goes
+   through it), which queues the datum; a deferred constraint trigger on the coordinator runs at COMMIT -- before
+   Citus sends PREPARE to any worker -- and refuses the whole transaction (`check_violation`, the report as JSON in
+   DETAIL) if any datum written breaks its shape. `iq.shacl_check(datum)` gives the same report on demand.
+   - 9 of IQ's 11 shapes graphs compile (928 property shapes); ScapeShape (`sh:or`) and MarkovKernel (`sh:node`,
+     `sh:sparql`) are refused, not half-enforced.
+   - Each kind of break of a Claim is refused at COMMIT and nothing of it lands; a subclass instance is held to its
+     superclass's shape; `sh:class` is checked across datums inside the transaction (a FileAt may point at a Blob
+     typed later in the same transaction); removing a required triple is refused; a bad datum on one worker keeps a
+     good one on the other out; a changed shape applies from the next commit; the role `iq_agent` cannot write
+     around the shapes.
+   - **Against UC_OntologyPipeline's own SHACL validator** (over Oxigraph, sharing no code): 200 datums generated
+     from the Store shapes, most broken one way -- the same 139 violations, of all seven kinds.
+   - Cost: a commit held to the shapes, 112 ms for one Claim over the tunnel; 45 ms a datum checked on demand.
+   - Each of three breaks is caught (no check at commit: 12 scenarios fail; `sh:class` always true; `sh:closed`
+     ignored).
+   - Found: Citus refuses a transaction in which two users touch the same shards, so the write path's functions
+     are `iq`'s (SECURITY DEFINER), not postgres's; and an error raised on a worker inside a function's `INSERT ...
+     SELECT` comes back as XX000, so `put_datum` checks for missing terms itself.
+   - Not yet: a focus node is held to its own datum's triples (the plane's one-datum-per-subject rule); `drop_datum`
+     does not recheck datums that point at the dropped one with `sh:class`; `iq` itself still has direct DML (only
+     `iq_agent` is held to the governed path) until the gate is the only writer (slice 5).
 3. **The plane's adapter.** A `CitusAdapter` for `dataplane.py` (record and graph roles in one), so the conformance
    suite (`GherkinIq/Facet/Store/features/dataplane.feature`) runs against the cluster; `plane_sparql` via the SQL
    translation.
