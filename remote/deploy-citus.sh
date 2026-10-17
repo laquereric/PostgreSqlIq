@@ -11,8 +11,10 @@
 #   ./deploy-citus.sh hosts-down  # destroy the four and the VPC
 #   ./deploy-citus.sh lake-build  # pg_lake for PG17/el9, built on a throwaway vc2-6c-16gb (iq-citus-build), packed into
 #                                 # ~/.iq/citus/pg_lake-<tag>-pg17-el9.tar.gz; the box is destroyed after
-#   ./deploy-citus.sh lake-up     # the cold tier on the coordinator: that build, pgduck_server, an S3 store
-#                                 # (service/install-lake.sh; SeaweedFS on loopback unless S3_ENDPOINT is given)
+#   ./deploy-citus.sh lake-up     # the cold tier on the coordinator: that build, pgduck_server, and Vultr Object
+#                                 # Storage as its store (lake-vultr); LAKE_STORE=loopback: SeaweedFS on loopback
+#   ./deploy-citus.sh lake-vultr  # the cold tier moved onto Vultr Object Storage (the subscription holding iq-blobs),
+#                                 # in its own bucket iq-lake; the key goes from the API to the coordinator only
 #   ./deploy-citus.sh status      # every iq-citus instance
 #   ./deploy-citus.sh psql [sql]  # the coordinator as postgres, over ssh (superuser stays on the host)
 #
@@ -215,13 +217,49 @@ lake_build() {
 
 lake_build_down() { local id; id=$(by_label "$LABEL-build"); [ -n "$id" ] && api DELETE "/instances/$id" >/dev/null && say "destroyed $LABEL-build"; return 0; }
 
+object_storage() { # the Object Storage subscription that holds iq-blobs (UC_BlobStore): id, hostname
+  api GET /object-storage | jq -r --arg h "${S3_HOSTNAME:-ewr1.vultrobjects.com}" \
+    '[.object_storages[] | select(.s3_hostname==$h and .status=="active")][0] // empty | "\(.id) \(.s3_hostname) \(.label)"'
+}
+
+lake_vultr() { # the cold tier on Vultr Object Storage: a bucket of its own (LAKE_BUCKET), never iq-blobs
+  local h sub host bucket="${LAKE_BUCKET:-iq-lake}"
+  h=$(jq -r .coordinator.host "$STATE/topology.json")
+  read -r sub host _ <<<"$(object_storage)"; [ -n "$sub" ] || { echo "no active Object Storage on ${S3_HOSTNAME:-ewr1.vultrobjects.com}" >&2; exit 1; }
+  [ "$bucket" != iq-blobs ] || { echo "the cold tier does not share iq-blobs" >&2; exit 1; }
+  # the subscription's S3 key, from the API straight into a root-only file on the coordinator (never on this disk)
+  api GET "/object-storage/$sub" | jq -r '.object_storage | "\(.s3_access_key):\(.s3_secret_key)"' |
+    ssh "${SSHO[@]}" "root@$h" 'umask 077; cat > /root/iq-lake-s3.txt'
+  ssh "${SSHO[@]}" "root@$h" "HOST=$host BUCKET=$bucket bash -s" <<'BUCKET'
+set -euo pipefail
+K=$(cut -d: -f1 /root/iq-lake-s3.txt); S=$(cut -d: -f2- /root/iq-lake-s3.txt)
+EMPTY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855   # sha256(""): Vultr wants the payload hash signed
+code=$(curl -s -o /tmp/bucket.out -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user "$K:$S" \
+  -H "x-amz-content-sha256: $EMPTY" -H "Content-Length: 0" -X PUT "https://$HOST/$BUCKET")
+case "$code" in
+  200) echo "created bucket $BUCKET on $HOST" ;;
+  409) grep -q BucketAlreadyOwnedByYou /tmp/bucket.out && echo "bucket $BUCKET is already ours" || { cat /tmp/bucket.out; exit 1; } ;;
+  *) echo "bucket $BUCKET: HTTP $code"; cat /tmp/bucket.out; exit 1 ;;
+esac
+rm -f /tmp/bucket.out
+BUCKET
+  # what the loopback store held was test data: its Iceberg table and the store itself go
+  ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -d iq -c 'DROP TABLE IF EXISTS iq.event_cold CASCADE' 2>&1 | grep -v NOTICE || true
+    systemctl disable -q --now iq-s3 2>/dev/null || true"
+  ssh "${SSHO[@]}" "root@$h" "S3_ENDPOINT=$host S3_BUCKET=$bucket S3_KEY_FILE=/root/iq-lake-s3.txt bash -s" < "$here/service/install-lake.sh"
+}
+
 lake_up() {
   local h tar
   h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
   tar=$(ls -t "$STATE"/pg_lake-*-pg17-el9.tar.gz 2>/dev/null | head -1)
   [ -n "$tar" ] || { echo "no pg_lake build: $0 lake-build" >&2; exit 1; }
   scp -q "${SSHO[@]}" "$tar" "root@$h:/root/"
-  ssh "${SSHO[@]}" "root@$h" bash -s < "$here/service/install-lake.sh"
+  if [ "${LAKE_STORE:-vultr}" = loopback ]; then   # a test with no bucket: SeaweedFS on the coordinator's loopback
+    ssh "${SSHO[@]}" "root@$h" bash -s < "$here/service/install-lake.sh"
+  else
+    tunnel; lake_vultr
+  fi
 }
 
 up() {
@@ -256,7 +294,9 @@ case "${1:-}" in
   up|down|status) tunnel; "$1" ;;
   hosts-up|hosts-down|lake-build|lake-build-down) tunnel; f="${1//-/_}"; "$f" ;;
   lake-up) lake_up ;;
+  object-storage) tunnel; object_storage ;;
+  lake-vultr) tunnel; lake_vultr ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 up | down | hosts-up | hosts-down | lake-build | lake-build-down | lake-up | lake-vultr | object-storage | status | psql [sql]" >&2; exit 2 ;;
 esac

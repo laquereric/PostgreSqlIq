@@ -128,14 +128,17 @@ conversation.
    and `iq.tier_out(t)` moves every month that ended before `t` in ONE transaction (copy into Iceberg, drop the
    partition). `deploy-citus.sh lake-build` compiles pg_lake (DuckDB, the Azure SDK) for PG17/el9 on a throwaway
    vc2-6c-16gb and keeps only the packed result; `lake-up` installs it with `pgduck_server` (unix socket only) and
-   an S3 store. **The store is SeaweedFS on the coordinator's loopback** (MinIO's community binaries are withdrawn,
-   HTTP 410): writing the test's cold tier into `iq-blobs` would be a production write with production keys, so a
-   real bucket is `S3_ENDPOINT=... S3_BUCKET=... S3_KEY_FILE=...` once one is chosen. `features/tiered.feature`
-   (6 scenarios; skipped on a cluster without the cold tier). **Built 2026-10-17: all 6 pass on the VPC cluster**
+   puts the cold tier on **Vultr Object Storage** (`lake-vultr`): the subscription that holds `iq-blobs`
+   (UC_BlobStore, `ewr1.vultrobjects.com`), in a bucket of its own, `iq-lake` -- `iq-blobs` is never written. The
+   subscription's S3 key is read from the Vultr API and piped over ssh into a root-only file on the coordinator (and
+   pgduck_server's secret); it is never on this disk. (Vultr wants the payload hash signed: `x-amz-content-sha256`.)
+   `LAKE_STORE=loopback` keeps the first run's SeaweedFS stand-in for a test with no bucket. `features/tiered.feature`
+   (6 scenarios; skipped on a cluster without the cold tier). **Built 2026-10-17: all 6 pass on the VPC cluster, the
+   cold tier on Vultr Object Storage**
    ([`TIERED-hosts.md`](TIERED-hosts.md)), pg_lake 3.5.7 preloaded beside Citus 14.2 on PostgreSQL 17.11:
    - an Iceberg write rolls back and commits with Postgres; its files on the store are Iceberg (metadata JSON,
      Avro manifests, Parquet);
-   - moving two months (1,000 events) to Iceberg takes 0.7 s in one transaction, and the events by month and a
+   - moving two months (1,000 events) to Iceberg on Vultr takes 1.0-1.4 s in one transaction (0.7 s on loopback), and the events by month and a
      checksum over every event are unchanged; a move failing after the copy leaves every month hot and Iceberg
      without them;
    - a reader counting both tiers through the move sees 2,000 every time (24 reads); with the move split into two
@@ -148,7 +151,8 @@ conversation.
    - Found: pg_lake checks the Iceberg location is empty even on `CREATE TABLE IF NOT EXISTS` of a table that
      exists; the PGDG build needs `with_llvm=no` (no clang) and `krb5-devel`; and the union view is local to the
      coordinator (Citus cannot distribute a view over a foreign table) -- which is where it is read.
-   - Not yet: a real bucket (the cold tier is on loopback); the move scheduled (pg_cron); a month brought back hot.
+   - Not yet: the move scheduled (pg_cron); a month brought back hot; a key scoped to `iq-lake` alone (Vultr's
+     subscription key reaches every bucket in it, `iq-blobs` included).
 3. **The plane's adapter.** A `CitusAdapter` for `dataplane.py` (record and graph roles in one), so the conformance
    suite (`GherkinIq/Facet/Store/features/dataplane.feature`) runs against the cluster; `plane_sparql` via the SQL
    translation.

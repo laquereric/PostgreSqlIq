@@ -104,6 +104,8 @@ def step_files(context):
     files = context.cluster.host_sh(PGDUCK % "\"SELECT file FROM glob('%s/**')\"" % loc.rsplit("/metadata/", 1)[0])
     kinds = {f.rsplit(".", 1)[-1] for f in files.split()}
     assert {"json", "parquet", "avro"} <= kinds, kinds
+    endpoint = context.cluster.host_sh("grep -o \"ENDPOINT '[^']*'\" /etc/iq-pgduck/init.sql | cut -d\"'\" -f2").strip()
+    context.measures["cold tier store"] = "%s on %s" % (loc.split("/iq/iq/")[0], endpoint)
     context.measures["cold tier files"] = "%d (%s), metadata %s" % (len(files.split()), ", ".join(sorted(kinds)), loc.split("/")[-1][:24])
 
 

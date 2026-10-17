@@ -10,9 +10,10 @@
 #                 only (DDL propagation off: the workers hold no Iceberg tables)
 #   pgduck_server DuckDB behind the Postgres protocol, systemd unit iq-pgduck, unix socket only
 #                 (/var/run/iq-pgduck, group postgres), its S3 secret in an init file readable by postgres only
-#   object store  S3_ENDPOINT unset: SeaweedFS 4.48 (Apache-2.0; MinIO's community binaries are withdrawn), pinned by
+#   object store  S3_ENDPOINT set (deploy-citus.sh lake-vultr): Vultr Object Storage, bucket S3_BUCKET, key in S3_KEY_FILE.
+#                 S3_ENDPOINT unset (a test with no bucket): SeaweedFS 4.48 (Apache-2.0; MinIO's community binaries are withdrawn), pinned by
 #                 sha256, unit iq-s3 on 127.0.0.1:8333 only, one bucket `iq-lake`, a key generated here into
-#                 /root/iq-s3.txt. S3_ENDPOINT/S3_BUCKET/S3_KEY_FILE set: that store instead (e.g. a Vultr bucket).
+#                 /root/iq-s3.txt.
 set -euo pipefail
 BIN=/usr/pgsql-17/bin
 DATA=/var/lib/pgsql/17/coord
@@ -92,6 +93,10 @@ for _ in $(seq 30); do [ -S /var/run/iq-pgduck/.s.PGSQL.5332 ] && break; sleep 1
 [ -S /var/run/iq-pgduck/.s.PGSQL.5332 ] || { journalctl -u iq-pgduck --no-pager | tail -20; exit 1; }
 
 # 4. the coordinator: preload, point at pgduck and the bucket, create the extensions here only
+if grep -q '^pg_lake_iceberg.default_location_prefix' "$DATA/iq.conf"; then
+  sed -i "s#^pg_lake_iceberg.default_location_prefix = .*#pg_lake_iceberg.default_location_prefix = 's3://$S3_BUCKET/iceberg'#" "$DATA/iq.conf"
+  sudo -u postgres "$BIN/pg_ctl" -D "$DATA" reload >/dev/null
+fi
 if ! grep -q pg_extension_base "$DATA/iq.conf"; then
   sed -i "s/^shared_preload_libraries = 'citus'$/shared_preload_libraries = 'citus,pg_extension_base'/" "$DATA/iq.conf"
   cat >> "$DATA/iq.conf" <<CONF
