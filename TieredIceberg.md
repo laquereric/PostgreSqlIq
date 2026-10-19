@@ -1,4 +1,4 @@
-@use_case Development/UseCase/UC_Postgres
+@use_case Development/UseCase/UC_PostgreSqliq
 @facet Agent
 
 does the postgres ecosystem support iceberg tiered storage

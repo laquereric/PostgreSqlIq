@@ -61,7 +61,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_BRIDGE = os.path.abspath(os.path.join(_HERE, "..", "UC_LaptopCloudBridge"))
+_BRIDGE = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "Development", "UseCase", "UC_LaptopCloudBridge"))
 
 
 def _bridge(name: str):

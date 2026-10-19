@@ -1,7 +1,7 @@
 -- @use_case Development/UseCase/UC_Citus
 -- @facet Store
 --
--- Tiered storage, hot Postgres and cold Iceberg (from UC_Postgres/TieredIceberg,md): the pattern of pgEdge
+-- Tiered storage, hot Postgres and cold Iceberg (from UC_PostgreSqliq/TieredIceberg,md): the pattern of pgEdge
 -- ColdFront and EDB PGAA, built from pg_lake. Applied as postgres after install-lake.sh; idempotent.
 --
 --   iq.event          the HOT tier: a Citus table distributed by iri (co-located with iq.datum), partitioned by

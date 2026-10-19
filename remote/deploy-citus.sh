@@ -56,7 +56,7 @@ tunnel() {
   PROXY=(--socks5-hostname "127.0.0.1:$SOCKS_PORT")
 }
 api() { # method path [json]
-  local key="${VULTR_API_KEY:-$("$here/../UC_App/iq-vault.sh" get VULTR_API_KEY || true)}"
+  local key="${VULTR_API_KEY:-$("$here/../../../Development/UseCase/UC_App/iq-vault.sh" get VULTR_API_KEY || true)}"
   [ -n "$key" ] || { echo "no VULTR_API_KEY: add it on the IQ app's Vault page" >&2; exit 1; }
   curl -fsS ${PROXY[@]+"${PROXY[@]}"} -X "$1" "$API$2" -H "Authorization: Bearer $key" -H 'Content-Type: application/json' ${3:+-d "$3"}
 }

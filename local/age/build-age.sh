@@ -1,5 +1,5 @@
 #!/bin/zsh
-# @use_case Development/UseCase/UC_Postgres
+# @use_case Development/UseCase/UC_PostgreSqlIq
 # @facet Store
 #
 # Apache AGE (openCypher graphs in Postgres) built INTO the image python's pgembed: AGE has no pgembed companion

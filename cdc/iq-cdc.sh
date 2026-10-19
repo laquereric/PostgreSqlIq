@@ -22,7 +22,7 @@
 # Env: IQ_REGISTRY_DSN / IQ_PGDATA, IQ_MEMORY (https://memory.intentionalquality.com), IQ_HARNESS_SESSION
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-APP="$HERE/../UC_App"
+APP="${IQ_REPO:-$HERE/../../..}/Development/UseCase/UC_App"   # IQ vendors this repo at vendor/PostgreSqlIq
 PY="${IQ_PYTHON:-$("$APP/iq-python.sh" --bin)}" || { echo "[iq-cdc] no IQ python" >&2; exit 1; }
-"$APP/iq-pg.sh" --check || { echo "[iq-cdc] the box's Postgres is down -- start the IQ app or run UC_App/iq-pg.sh" >&2; exit 1; }
+"$HERE/../local/iq-pg.sh" --check || { echo "[iq-cdc] the box's Postgres is down -- start the IQ app or run vendor/PostgreSqlIq/local/iq-pg.sh" >&2; exit 1; }
 exec "$PY" "$HERE/cdc.py" "$@"

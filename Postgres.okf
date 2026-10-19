@@ -1,5 +1,5 @@
 ---
-@use_case Development/UseCase/UC_Postgres
+@use_case Development/UseCase/UC_PostgreSqliq
 @facet Store
 @status Proposed
 format: okf/1.0

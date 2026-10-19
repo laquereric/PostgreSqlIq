@@ -1,4 +1,4 @@
-@use_case Development/UseCase/UC_Postgres
+@use_case Development/UseCase/UC_PostgreSqliq
 @facet Agent
 
 database with built-in SHACL engines:

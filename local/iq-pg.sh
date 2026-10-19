@@ -1,5 +1,5 @@
 #!/bin/zsh
-# @use_case Development/UseCase/UC_App
+# @use_case Development/UseCase/UC_PostgreSqlIq
 # @facet Store
 #
 # The box's own Postgres -- the IQ store standard (pgembed, IQ_REGISTRY_DSN) -- brought up by the IQ app the way its
@@ -14,13 +14,14 @@
 # Never a Homebrew or system postgres: the image's, or nothing (exit 1, fail closed).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
+APP="${IQ_REPO:-$HERE/../../..}/Development/UseCase/UC_App"   # IQ vendors this repo at vendor/PostgreSqlIq
 PGDATA="${IQ_PGDATA:-$HOME/.iq/pg}"; DB="${IQ_PGDATABASE:-iq}"
 DSN="postgresql://postgres@/$DB?host=$PGDATA"
 case "${1:-}" in
   --dsn) echo "$DSN"; exit 0 ;;
 esac
-PY="${IQ_PYTHON:-$("$HERE/iq-python.sh" --bin)}" || { echo "[iq-pg] no IQ python" >&2; exit 1; }
-"$PY" -c "import pgembed, psycopg" 2>/dev/null || { echo "[iq-pg] the IQ python at $PY lacks pgembed/psycopg -- rebuild the image runtime: $HERE/iq-python.sh" >&2; exit 1; }
+PY="${IQ_PYTHON:-$("$APP/iq-python.sh" --bin)}" || { echo "[iq-pg] no IQ python" >&2; exit 1; }
+"$PY" -c "import pgembed, psycopg" 2>/dev/null || { echo "[iq-pg] the IQ python at $PY lacks pgembed/psycopg -- rebuild the image runtime: $APP/iq-python.sh" >&2; exit 1; }
 case "${1:-}" in
   --check)
     exec "$PY" -c "import psycopg,sys

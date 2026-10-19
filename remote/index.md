@@ -91,7 +91,7 @@ conversation.
      worker already in the cluster ("operation is not allowed on this node").
    The fork [laquereric/citus](https://github.com/laquereric/citus) (2026-10-17) is where the
    `citus_remove_node` cleanup fix would go; the cluster still runs the packaged 14.2.
-2b. **SHACL at commit** (from `UC_Postgres/SHACL.md`). **Built 2026-10-17: 15 scenarios pass on both topologies**
+2b. **SHACL at commit** (from `UC_PostgreSqliq/SHACL.md`). **Built 2026-10-17: 15 scenarios pass on both topologies**
    ([`SHACL-hosts.md`](SHACL-hosts.md)). GraphDB checks each transaction against the shapes at commit and refuses
    what violates them; Postgres has no SHACL engine (pgRDF's -- forked as
    [laquereric/pgRDF](https://github.com/laquereric/pgRDF) -- is a stub until its 0.4). So: **shapes compiled to
@@ -120,7 +120,7 @@ conversation.
    - Not yet: a focus node is held to its own datum's triples (the plane's one-datum-per-subject rule); `drop_datum`
      does not recheck datums that point at the dropped one with `sh:class`; `iq` itself still has direct DML (only
      `iq_agent` is held to the governed path) until the gate is the only writer (slice 5).
-2c. **Hot Postgres, cold Iceberg** (from `UC_Postgres/TieredIceberg,md`). The ColdFront / PGAA pattern built from
+2c. **Hot Postgres, cold Iceberg** (from `UC_PostgreSqliq/TieredIceberg,md`). The ColdFront / PGAA pattern built from
    [pg_lake](https://github.com/Snowflake-Labs/pg_lake) (Apache-2.0) on the coordinator: `iq.event` is the hot tier
    (distributed, co-located with `iq.datum`, a partition a month), `iq.event_cold` the cold tier (an Iceberg table;
    pg_lake keeps the Iceberg catalog in Postgres, so a write to it commits or rolls back with the transaction),
@@ -224,5 +224,5 @@ conversation.
 ## Run
 
     ./deploy-citus.sh up            # slice 1: one host (or hosts-up: a VPC and a host per node); ~5 min
-    cd features && "$(../../UC_App/iq-python.sh --bin)" -m behave   # the 10 scenarios; writes ACID.md
+    cd features && "$(../../../../Development/UseCase/UC_App/iq-python.sh --bin)" -m behave   # the 10 scenarios; writes ACID.md
     ./deploy-citus.sh down          # or hosts-down: destroy, which is what stops the billing

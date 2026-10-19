@@ -21,7 +21,7 @@ IDLE="${IDLE_SECS:-7200}"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 if [ "${1:-}" = "--remove" ]; then rm -f "$PLIST"; echo "[autopark] $LABEL removed"; exit 0; fi
 
-"$UC/../UC_App/iq-vault.sh" has VULTR_API_KEY || { echo "[autopark] no VULTR_API_KEY in the Vault; nothing installed"; exit 1; }
+"$UC/../../../Development/UseCase/UC_App/iq-vault.sh" has VULTR_API_KEY || { echo "[autopark] no VULTR_API_KEY in the Vault; nothing installed"; exit 1; }
 mkdir -p "$HOME/Library/LaunchAgents" "${LOG:h}"
 cat > "$PLIST" <<PL
 <!--
