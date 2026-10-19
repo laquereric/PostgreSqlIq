@@ -114,9 +114,11 @@ def _write(context, n, table):
 
 def _apply(context):
     assert APPLY.prepare_lake(_global_dsn(), TARGET)["ok"]
-    with psycopg.connect(_global_dsn(), autocommit=True) as c:
-        r = APPLY.apply(c, APPLY.records_in(context.server.store), host="box", source_schema=SOURCE,
-                        target_schema=TARGET)
+    rep = APPLY.replica(_global_dsn(), TARGET)
+    try:
+        r = APPLY.apply(rep, APPLY.records_in(context.server.store), host="box", source_schema=SOURCE)
+    finally:
+        rep.close()
     assert r["ok"], r
     return r
 
