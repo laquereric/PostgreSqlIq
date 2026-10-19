@@ -26,6 +26,14 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     And the inserted record has id 1 as a number and its tags as JSON
     And the slot has nothing left
 
+  Scenario: Every row of a COPY reaches the server, though one WAL record carries them all
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When notes 1 to 4 are copied in
+    And the streamer runs one cycle
+    Then the server holds 4 records of op cdc:insert
+    And the slot has nothing left
+
   Scenario: A down server reads nothing and advances nothing; the change ships when it is up
     Given CDC is set up on a fresh notes table
     And the IQ Server is down

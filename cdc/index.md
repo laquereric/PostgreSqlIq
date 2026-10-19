@@ -123,7 +123,7 @@ rows), and finished (`2444:2444:` at 0/20643A8).
 - After `pg_ctl restart`, pgembed's handle no longer knows the postmaster, so its cleanup leaves it running. The
   scenarios stop it by its data directory.
 
-`features/cdc.feature`: 39 scenarios, all passing in about 2.5 s (12 for the stream, 7 for the snapshot plus 8
+`features/cdc.feature`: 39 scenarios (40 with slice 6's COPY scenario), all passing in about 2.5 s (12 for the stream, 7 for the snapshot plus 8
 xid-visibility examples, 1 for credentials, 3 for the lag including the Agents tab's value, 6 for row filters, 4 for column lists), on a scratch pgembed cluster with the relay
 in-process (nothing reaches the IQ Server):
 
@@ -135,4 +135,30 @@ scratch dashboard on :8031, then back to :8030).
 
 **Limits.** In a table with no primary key, identical rows have the same content and so one snapshot record.
 
-**Next.** Nothing queued. The publication can now be narrowed both ways (rows and columns).
+**The lake's catalog, replayed into the global cluster (slice 6, 2026-10-19).** The data plane's Gold is a DuckLake
+(`GherkinIq/Facet/Store/lake.py`). Its catalog lives in the User/Group domain's local Postgres and reaches the
+global Postgres cluster by CDC, and BI (UC_Superset) attaches the replica read-only. Three pieces:
+
+- `cdc.publish_schema(dsn, "ducklake")` adds the schema to `iq_cdc` with every table `REPLICA IDENTITY FULL`.
+  An event trigger (`iq_cdc_full_identity`) does the same for tables created there later. DuckLake's catalog
+  tables mostly have no key, and Postgres refuses UPDATE and DELETE on a published table without an identity, so
+  without this the lake's own writer would break. The lake writes with data inlining off, so rows go to Parquet and
+  never into the catalog.
+- `apply.py` is the far side. It replays one schema's records into a target schema: the latest snapshot as the base,
+  then the stream past a watermark (`iq_cdc_apply.applied`), one target transaction per source transaction. An
+  update or delete matches its whole old row, one row. CDC tokenizes every e-mail in a value, so a min/max statistic
+  carrying a token no longer bounds its file; the applier writes it as NULL, so the reader scans that file rather
+  than pruning it. `prepare_lake` has DuckLake create the target's catalog tables, then empties them.
+- **A fix to the stream:** a COPY's rows share one WAL record and so one LSN. They all got the same operationId,
+  and every row but one was dropped as "already held". The decoder now numbers rows under an LSN (`seq`), and the
+  second and later rows' keys include it. A first row keeps the key it always had, so records already shipped
+  keep theirs. DuckLake writes its catalog with COPY, which is how this came to light.
+
+`features/lake_apply.feature` covers it in 6 scenarios: the box's scratch Postgres with a real slot, the relay
+in-process, a second scratch Postgres as the global cluster, and DuckLake reading the replica read-only, as
+Superset does. Plus `cdc.feature` "Every row of a COPY reaches the server", which fails on the old key. 46
+scenarios in all. Not live: the box's publication does not include `ducklake` yet, and nothing runs `apply.py`
+against the global cluster.
+
+**Next.** Run `apply.py` where it reaches both the blobs and the global cluster. Narrow its read of
+`auth/events/` to the days past the watermark, because today it lists the whole prefix.

@@ -184,6 +184,16 @@ def _iud(context):
         c.execute("DELETE FROM notes WHERE id = 2")
 
 
+@when("notes {a:d} to {b:d} are copied in")
+def _copy(context, a, b):
+    _streamer(context).cycle()                  # ship the setup row so the scenario counts only its own rows
+    context.server.store.blobs.clear()
+    with psycopg.connect(context.dsn, autocommit=True) as c:
+        with c.cursor().copy("COPY notes (id, body) FROM STDIN") as cp:
+            for i in range(a, b + 1):
+                cp.write_row((i, "copied"))
+
+
 @when("note {n:d} is inserted")
 def _insert(context, n):
     _sql(context, "INSERT INTO notes (id, body) VALUES (%s, 'note')", (n,))

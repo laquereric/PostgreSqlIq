@@ -18,6 +18,7 @@
 #   iq-cdc.sh once                                   one cycle (exit 0 = shipped or nothing to ship, server up)
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out
 #   iq-cdc.sh teardown                               drop the slot and publication (stop holding WAL)
+#   iq-cdc.sh publish ducklake                       add the lake's catalog schema, REPLICA IDENTITY FULL
 # Env: IQ_REGISTRY_DSN / IQ_PGDATA, IQ_MEMORY (https://memory.intentionalquality.com), IQ_HARNESS_SESSION
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"

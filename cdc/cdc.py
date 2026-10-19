@@ -178,6 +178,7 @@ class Decoder:
         self.rel = {}                           # relid -> (schema.table, [(col, type oid)])
         self.txn = []                           # the open transaction's changes
         self.xid = None
+        self.at_lsn = {}                        # LSN -> rows seen under it in the open transaction
 
     def feed(self, lsn: str, data: bytes):
         """One message. Returns the closed transaction's changes on its commit, a ("commit", end_lsn) marker for
@@ -187,7 +188,7 @@ class Decoder:
         if t == "B":
             b.take("q")
             b.take("q")
-            self.xid, self.txn = b.take("i"), []
+            self.xid, self.txn, self.at_lsn = b.take("i"), [], {}
         elif t == "R":
             relid, ns, name = b.take("I"), b.cstr(), b.cstr()
             b.byte()
@@ -204,6 +205,12 @@ class Decoder:
             table, cols = self.rel.get(relid, ("relid:%d" % relid, []))
             ch = {"op": {"I": "insert", "U": "update", "D": "delete"}[t], "table": table, "lsn": lsn,
                   "xid": self.xid, "old": None, "new": None}
+            # One WAL record can carry many rows (a COPY is a multi-insert): they share its LSN, so their place
+            # under it is part of their identity. seq 0 is the record's first row.
+            seq = self.at_lsn.get(lsn, 0)
+            self.at_lsn[lsn] = seq + 1
+            if seq:
+                ch["seq"] = seq
             k = b.byte()
             if k in "KO":                       # old key ('K') or whole old row ('O', REPLICA IDENTITY FULL)
                 ch["old"] = _tuple(b, cols, key_only=(k == "K"))
@@ -269,7 +276,44 @@ def teardown(d: str, state: str = "") -> dict:
         if slot:
             c.execute("select pg_drop_replication_slot(%s)", (SLOT,))
         c.execute("DROP PUBLICATION IF EXISTS %s" % PUBLICATION)
+        c.execute("DROP EVENT TRIGGER IF EXISTS %s" % FULL_TRIGGER)
     return {"ok": True, "dropped_slot": slot}
+
+
+FULL_TRIGGER = "iq_cdc_full_identity"
+
+
+def publish_schema(d: str, schema: str) -> dict:
+    """Add a whole schema to the publication with every table in it REPLICA IDENTITY FULL, now and when created
+    later (an event trigger). For a schema whose tables have no key -- DuckLake's catalog (lake.py): published
+    without an identity, Postgres refuses their UPDATE and DELETE, and the lake's writer breaks. FULL also makes an
+    update's or delete's `old` the whole row, which is what apply.py matches on. Idempotent."""
+    with _connect(d) as c:
+        if not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
+            return {"ok": False, "reason": "no_publication", "detail": "run setup first"}
+        c.execute("CREATE SCHEMA IF NOT EXISTS %s" % _ident(schema))
+        c.execute("""CREATE OR REPLACE FUNCTION %s() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+            DECLARE r record;
+            BEGIN
+              FOR r IN SELECT d.objid::regclass AS t FROM pg_event_trigger_ddl_commands() d
+                       WHERE d.object_type = 'table' AND d.schema_name IN (
+                         SELECT n.nspname FROM pg_publication_namespace pn
+                         JOIN pg_namespace n ON n.oid = pn.pnnspid
+                         JOIN pg_publication p ON p.oid = pn.pnpubid
+                         WHERE p.pubname = '%s' AND n.nspname <> 'public')
+              LOOP EXECUTE format('ALTER TABLE %%s REPLICA IDENTITY FULL', r.t); END LOOP;
+            END $f$""" % (FULL_TRIGGER, PUBLICATION))
+        if not c.execute("select 1 from pg_event_trigger where evtname=%s", (FULL_TRIGGER,)).fetchone():
+            c.execute("CREATE EVENT TRIGGER %s ON ddl_command_end WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')"
+                      " EXECUTE FUNCTION %s()" % (FULL_TRIGGER, FULL_TRIGGER))
+        tables = [r[0] for r in c.execute("select tablename from pg_tables where schemaname=%s", (schema,))]
+        for t in tables:
+            c.execute("ALTER TABLE %s.%s REPLICA IDENTITY FULL" % (_ident(schema), _ident(t)))
+        if not c.execute("select 1 from pg_publication_namespace pn join pg_namespace n on n.oid = pn.pnnspid "
+                         "join pg_publication p on p.oid = pn.pnpubid where p.pubname=%s and n.nspname=%s",
+                         (PUBLICATION, schema)).fetchone():
+            c.execute("ALTER PUBLICATION %s ADD TABLES IN SCHEMA %s" % (PUBLICATION, _ident(schema)))
+    return {"ok": True, "schema": schema, "tables": len(tables)}
 
 
 def status(d: str) -> dict:
@@ -325,11 +369,19 @@ def advance(c, lsn: str):
 
 # -- changes -> relay records -----------------------------------------------------------------------------
 def record(change: dict, sysid: str, host: str = "") -> dict:
-    opid = hashlib.sha256(("%s:%s" % (sysid, change["lsn"])).encode()).hexdigest()[:32]
-    return {"operation_id": "iq:op:" + opid, "op": "cdc:" + change["op"], "decision": "captured",
+    """A change as shipped. Its operationId is a function of where it is in the WAL: the change's LSN, and for the
+    second and later rows of one WAL record (a COPY's multi-insert) its seq under that LSN -- without it those rows
+    would share a key and all but one be dropped as already held. A first row keeps the key it always had."""
+    seq = change.get("seq", 0)
+    where = "%s:%s" % (sysid, change["lsn"]) + (":%d" % seq if seq else "")
+    opid = hashlib.sha256(where.encode()).hexdigest()[:32]
+    rec = {"operation_id": "iq:op:" + opid, "op": "cdc:" + change["op"], "decision": "captured",
             "service": SERVICE, "at": change["at"], "host": host, "table": change["table"],
             "lsn": change["lsn"], "commit_lsn": change["commit_lsn"], "xid": change["xid"],
             "new": change["new"], "old": change["old"]}
+    if seq:
+        rec["seq"] = seq
+    return rec
 
 
 class Deidentifier:
@@ -765,6 +817,8 @@ def main(argv=None) -> int:
     s.add_argument("--restart", action="store_true", help="restart Postgres if wal_level must change")
     sub.add_parser("status")
     sub.add_parser("teardown")
+    pb = sub.add_parser("publish", help="add a whole schema, REPLICA IDENTITY FULL (the lake's catalog: ducklake)")
+    pb.add_argument("schema")
     sub.add_parser("snapshot", help="ship the rows that existed before the slot (drains the slot first)")
     f = sub.add_parser("filter", help="capture only matching rows of a table (publication row filter)")
     f.add_argument("table", nargs="?", help="schema.table (none: list the filters)")
@@ -815,6 +869,10 @@ def main(argv=None) -> int:
     if a.cmd == "teardown":
         print(json.dumps(teardown(d, state_path())))
         return 0
+    if a.cmd == "publish":
+        res = publish_schema(d, a.schema)
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
     base = os.environ.get("IQ_MEMORY", "https://memory.intentionalquality.com")
     creds = credentials()
     if a.cmd == "status":
