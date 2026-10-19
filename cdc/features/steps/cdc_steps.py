@@ -341,7 +341,7 @@ def _no_autostart(context):
     uc = context.uc
     assert not list(uc.rglob("*.plist*")), list(uc.rglob("*.plist*"))
     root = uc.parent.parent.parent
-    hits = subprocess.run(["git", "-C", str(root), "grep", "-l", "-e", "iq-cdc", "-e", "UC_CDC/cdc.py", "--",
+    hits = subprocess.run(["git", "-C", str(root), "grep", "-l", "-e", "iq-cdc", "-e", "UC_CDC/cdc.py", "-e", "PostgreSqlIq/cdc", "--",
                            "Development/UseCase/UC_App", "DeployIq", "scripts", "*.plist*"],
                           capture_output=True, text=True).stdout.split()
     assert hits == [], hits
@@ -543,7 +543,7 @@ def _small_cap(context, n):
 @then("the Agents tab's cdc value has the slot, the health and the last cycle")
 def _agents_tab(context):
     import importlib.util
-    path = context.uc.parent / "UC_Dashboard" / "tabs" / "agents" / "agents.py"
+    path = context.uc.parents[2] / "Development" / "UseCase" / "UC_Dashboard" / "tabs" / "agents" / "agents.py"
     spec = importlib.util.spec_from_file_location("iq_agents_tab", path)
     tab = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tab)
