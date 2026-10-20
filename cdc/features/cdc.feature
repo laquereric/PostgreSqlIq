@@ -302,3 +302,29 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     And the snapshot runs
     Then the server holds 2 records of op cdc:snapshot
     And every shipped record of public.notes carries only id and tags
+
+  Scenario: A device's cycle carries its heartbeat to the domain, saying how much it still holds
+    Given CDC is set up on a fresh notes table
+    And the box streams as a device, with its heartbeat
+    And the IQ Server is up
+    When note 1 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+    And the server holds 1 records of op cdc:status
+    And the heartbeat names the box and less than 1 kB pending
+
+  Scenario: An idle device is still seen, but no more often than its heartbeat interval
+    Given CDC is set up on a fresh notes table
+    And the box streams as a device, with its heartbeat
+    And the IQ Server is up
+    When the same streamer runs 3 cycles
+    Then the server holds 1 records of op cdc:status
+
+  Scenario: A domain that is down hears no heartbeat, and nothing is lost by it
+    Given CDC is set up on a fresh notes table
+    And the box streams as a device, with its heartbeat
+    And the IQ Server is down
+    When note 1 is inserted
+    And the streamer runs one cycle
+    Then the server holds 0 records of op cdc:status
+    And the slot still holds the change

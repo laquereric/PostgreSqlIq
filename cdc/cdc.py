@@ -77,6 +77,7 @@ PUBLICATION = "iq_cdc"
 SERVICE = "iq-cdc"
 WAL_CAP = "1GB"
 BATCH = 200                     # records per POST /events
+STATUS_EVERY = 300              # seconds between heartbeats of an idle device (devices.py on the domain)
 PG_EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
@@ -384,6 +385,24 @@ def record(change: dict, sysid: str, host: str = "") -> dict:
     return rec
 
 
+def status_record(sysid: str, host: str, lsn: str, pending_bytes: int, kind: str = "", at: str = "") -> dict:
+    """The device's heartbeat to its domain: where its WAL stands and how much it still holds unshipped. The domain
+    turns it into the device's status (GherkinIq/Facet/Store/devices.py: seen, synced, pending, stale). It names no
+    table, so apply.py never replays it."""
+    at = at or datetime.now(timezone.utc).isoformat()
+    opid = hashlib.sha256(("%s:status:%s" % (sysid, at)).encode()).hexdigest()[:32]
+    return {"operation_id": "iq:op:" + opid, "op": "cdc:status", "decision": "captured", "service": SERVICE,
+            "at": at, "host": host, "table": "", "lsn": lsn, "commit_lsn": lsn, "pending_bytes": int(pending_bytes),
+            "kind": kind}
+
+
+def pending_bytes(c) -> int:
+    """The WAL written since the slot's confirmed position: what this device holds that its domain does not."""
+    r = c.execute("select pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint"
+                  " from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone()
+    return int(r[0] or 0) if r else 0
+
+
 class Deidentifier:
     """The bridge's Flusher de-identification, plus: an e-mail address anywhere in a value becomes the token of
     its identity. A tokenizer that cannot answer raises, and nothing ships."""
@@ -428,18 +447,35 @@ class Streamer:
     transaction the snapshot already saw is advanced over, not shipped."""
 
     def __init__(self, conn, *, up, deid, transport, host: str = "", limit: int = 1000, batch: int = BATCH,
-                 state: str = "", draining: bool = False):
+                 state: str = "", draining: bool = False, heartbeat: bool = False):
         self.c, self.up, self.deid, self.t = conn, up, deid, transport
+        self.heartbeat = heartbeat              # a device streaming to its domain says it is there (devices.py)
         self.host, self.limit, self.batch = host, limit, batch
         self.state, self.draining = state, draining
         self.sysid = system_id(conn)
+        self.kind, self.last_beat = os.environ.get("IQ_DEVICE_KIND", ""), 0.0
 
     def cycle(self) -> dict:
         out = self._cycle()
+        self._beat(out)
         if self.state:                          # the last cycle, for the lag's reader (the Dashboard)
             write_state(os.path.join(os.path.dirname(self.state), "cycle.json"),
                         dict(out, at=datetime.now(timezone.utc).isoformat()))
         return out
+
+    def _beat(self, out: dict):
+        """After a cycle that reached the domain cleanly: the heartbeat, when something shipped or the last one is
+        older than STATUS_EVERY -- so an idle device is still seen, and a busy one says how far behind it is."""
+        if not self.heartbeat or out.get("server") != "up" or out.get("error") or out.get("paused"):
+            return
+        if not out.get("sent") and time.monotonic() - self.last_beat < STATUS_EVERY:
+            return
+        try:
+            beat = status_record(self.sysid, self.host, flushed(self.c), pending_bytes(self.c), self.kind)
+            self.t.send([self.deid(beat)])
+            self.last_beat, out["status"] = time.monotonic(), beat["pending_bytes"]
+        except Exception as e:                  # a lost heartbeat costs staleness, never a change
+            out["status_error"] = str(e)
 
     def _cycle(self) -> dict:
         ok, http = self.up()
@@ -898,7 +934,7 @@ def main(argv=None) -> int:
         transport = _bridge("relay").HttpRelayTransport(base, bearer=creds[0])
         st = Streamer(c, up=PairedProbe(base, tokenizer, transport), deid=Deidentifier(tokenizer),
                       transport=transport, host=os.uname().nodename,
-                      state=state_path())
+                      state=state_path(), heartbeat=a.cmd != "snapshot")
         if a.cmd == "snapshot":
             res = snapshot(d, st, state_path())
             print(json.dumps(res, indent=2))

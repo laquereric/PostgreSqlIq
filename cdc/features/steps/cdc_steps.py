@@ -80,7 +80,7 @@ def _streamer(context):
     context.conn = context.conn or psycopg.connect(context.dsn, autocommit=True)
     return cdc.Streamer(context.conn, up=context.server.probe, deid=cdc.Deidentifier(context.tokens),
                         transport=context.server, host="box", batch=getattr(context, "batch", cdc.BATCH),
-                        state=context.state)
+                        state=context.state, heartbeat=getattr(context, "heartbeat", False))
 
 
 # -- setup -------------------------------------------------------------------------------------------------
@@ -240,6 +240,26 @@ def _crash(context):
 @when("the streamer runs one cycle")
 def _cycle(context):
     context.out = _streamer(context).cycle()
+
+
+@given("the box streams as a device, with its heartbeat")
+def _given_device(context):
+    context.heartbeat = True
+
+
+@when("the same streamer runs {n:d} cycles")
+def _cycles(context, n):
+    st = _streamer(context)
+    for _ in range(n):
+        context.out = st.cycle()
+
+
+@then("the heartbeat names the box and less than 1 kB pending")
+def _heartbeat(context):
+    beats = context.server.records()
+    beats = [r for r in beats if r["op"] == "cdc:status"]
+    assert len(beats) == 1 and beats[0]["host"] == "box" and beats[0]["pending_bytes"] < 1024, beats
+    assert beats[0]["table"] == "" and beats[0]["lsn"], beats
 
 
 @when("CDC is torn down")

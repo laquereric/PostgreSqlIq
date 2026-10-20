@@ -24,6 +24,10 @@ role (dataplane.Plane.replica), so this module orders, de-identifies and waterma
 how a row is matched, how json is held -- stays in its adapter (dataplane.PostgresReplica).
 
     python apply.py lake <target-dsn> <target-schema> --host <box> [--schema ducklake] [--blobs <dir>]
+                                                          [--domain <iq: IRI>]
+
+A device syncing to its domain is the same hop: with --domain, the device's heartbeat (cdc.status_record) and what
+the replay made of its records become the device's status in the domain (devices.observe).
 
 @use_case Development/UseCase/UC_CDC
 @facet Store
@@ -184,15 +188,23 @@ def main(argv=None) -> int:
     ap.add_argument("--host", required=True, help="the box whose records to replay (the record's `host`)")
     ap.add_argument("--schema", default="ducklake", help="the source schema on the box")
     ap.add_argument("--blobs", help="a local directory of records (default: the iq-blobs bucket, S3 creds)")
+    ap.add_argument("--domain", help="the domain's iq: IRI, when this hop is a device syncing to its domain: the"
+                                     " device's status is recorded (GherkinIq/Facet/Store/devices.py)")
     a = ap.parse_args(argv)
     store = DirStore(a.blobs) if a.blobs else _s3()
     print(json.dumps(prepare_lake(a.target_dsn, a.target_schema)))
+    recs = records_in(store)
     rep = replica(a.target_dsn, a.target_schema)
     try:
-        r = apply(rep, records_in(store), host=a.host, source_schema=a.schema)
+        r = apply(rep, recs, host=a.host, source_schema=a.schema)
     finally:
         rep.close()
     print(json.dumps(r))
+    if a.domain:
+        import devices
+        seen = devices.observe(_plane(a.target_dsn), a.domain, a.host, recs, r, "cdc-apply")
+        print(json.dumps({"device": a.host, "reported": seen.ok if seen else None,
+                          "reason": seen.reason if seen else "no heartbeat"}))
     return 0 if r["ok"] else 1
 
 
