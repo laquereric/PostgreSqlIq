@@ -19,7 +19,11 @@
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out
 #   iq-cdc.sh teardown                               drop the slot and publication (stop holding WAL)
 #   iq-cdc.sh publish ducklake                       add the lake's catalog schema, REPLICA IDENTITY FULL
-# Env: IQ_REGISTRY_DSN / IQ_PGDATA, IQ_MEMORY (https://memory.intentionalquality.com), IQ_HARNESS_SESSION
+#   iq-cdc.sh --hop proxy setup|snapshot|once|run|status|teardown
+#                                                    the domain's second hop: token status to the proxy, its own
+#                                                    slot iq_cdc_proxy; what it captures is fixed (cdc.HOPS).
+#                                                    The proxy puts it with: apply.py plane <routing DSN> --host <box>
+# Env: IQ_RECORD_DSN / IQ_REGISTRY_DSN / IQ_PGDATA, IQ_MEMORY (https://memory.intentionalquality.com), IQ_HARNESS_SESSION
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="${IQ_REPO:-$HERE/../../..}/Development/UseCase/UC_App"   # IQ vendors this repo at vendor/PostgreSqlIq

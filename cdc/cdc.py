@@ -45,6 +45,13 @@ published never leaves the box, in the stream or the snapshot. The list must inc
 one that does not is refused before it lands. Filters and column lists are kept together: setting one leaves the
 other as it is.
 
+**A second hop.** `iq-cdc.sh --hop proxy ...` is a hop of its own: slot and publication `iq_cdc_proxy`, service
+`iq-cdc-proxy`, its own snapshot state, operationIds seeded with the hop (the same change on two hops is two
+records). What it captures is fixed in HOPS, never narrowed or widened from the command line: the domain's
+`public.plane_datum`, rows `iri LIKE 'iq:token-status:%'` -- a token's status and nothing else, so the proxy can
+verify a token without knowing whose it is (UC_DataPlatform RegistryMove.md). The proxy puts what arrives on its
+plane (`apply.py plane`). It sends no device heartbeat; that is the default hop's.
+
 **Who never leaves the box.** Records cross the same de-identification the bridge's Flusher applies (`subject`
 dropped, `subject_iri` and any `iq:identity:` value tokenized by the IdentityMap); in addition any e-mail address
 in a captured value becomes the token of its identity, since a table row is not a log and may hold one anywhere.
@@ -75,6 +82,13 @@ def _bridge(name: str):
 SLOT = "iq_cdc"
 PUBLICATION = "iq_cdc"
 SERVICE = "iq-cdc"
+HOP = ""                        # the default hop: the box to its domain / the Big cluster (use_hop names another)
+HOPS = {
+    # The domain to the proxy (UC_DataPlatform RegistryMove.md): a token's status and nothing else, so the proxy can
+    # verify a token without knowing whose it is. Its own slot, so neither hop waits on the other; its tables and
+    # row filter are fixed here, never widened from the command line.
+    "proxy": {"tables": ("public.plane_datum",), "where": {"public.plane_datum": "iri LIKE 'iq:token-status:%'"}},
+}
 WAL_CAP = "1GB"
 BATCH = 200                     # records per POST /events
 STATUS_EVERY = 300              # seconds between heartbeats of an idle device (devices.py on the domain)
@@ -82,9 +96,27 @@ PG_EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
+def use_hop(name: str = "") -> None:
+    """Stream as hop `name` ("" = the default): its own slot and publication (iq_cdc_<name>), service
+    (iq-cdc-<name>, so its records have their own place in the store) and snapshot state. Only the hops HOPS names."""
+    global HOP, SLOT, PUBLICATION, SERVICE
+    if name and name not in HOPS:
+        raise ValueError("no such hop: %r (known: %s)" % (name, ", ".join(sorted(HOPS))))
+    HOP = name
+    SLOT = PUBLICATION = "iq_cdc" + ("_" + name if name else "")
+    SERVICE = "iq-cdc" + ("-" + name if name else "")
+
+
+def _seed(where: str) -> str:
+    """An operationId's seed: a named hop's records are its own (the same change on two hops is two records)."""
+    return HOP + ":" + where if HOP else where
+
+
 def dsn() -> str:
-    """The box's Postgres: IQ_REGISTRY_DSN, else iq-pg.sh's default (unix socket under ~/.iq/pg)."""
-    return os.environ.get("IQ_REGISTRY_DSN") or "postgresql://postgres@/iq?host=" + os.path.expanduser(
+    """The box's Postgres -- the store the data plane writes, in the order dataplane.from_env binds it: IQ_RECORD_DSN,
+    else IQ_REGISTRY_DSN, else iq-pg.sh's default (unix socket under ~/.iq/pg)."""
+    return os.environ.get("IQ_RECORD_DSN") or os.environ.get("IQ_REGISTRY_DSN") or \
+        "postgresql://postgres@/iq?host=" + os.path.expanduser(
         os.environ.get("IQ_PGDATA", "~/.iq/pg"))
 
 
@@ -259,11 +291,20 @@ def setup(d: str, tables=(), *, restart_cmd=None, wal_cap: str = WAL_CAP) -> dic
                     "detail": "wal_level is %s; set to logical, takes effect on restart" % level}
         restart_cmd()
     with _connect(d) as c:
+        if HOP:
+            tables = HOPS[HOP]["tables"]
+            missing_t = [t for t in tables if not c.execute("select to_regclass(%s)", (t,)).fetchone()[0]]
+            if missing_t:
+                return {"ok": False, "reason": "no_table", "detail": "the %s hop needs %s" % (HOP, ", ".join(missing_t))}
         if not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
             target = ("TABLE " + ", ".join(_ident(t) for t in tables)) if tables else "TABLES IN SCHEMA public"
             c.execute("CREATE PUBLICATION %s FOR %s" % (PUBLICATION, target))
         if not c.execute("select 1 from pg_replication_slots where slot_name=%s", (SLOT,)).fetchone():
             c.execute("select pg_create_logical_replication_slot(%s, 'pgoutput')", (SLOT,))
+    for table, where in (HOPS[HOP]["where"].items() if HOP else ()):
+        res = set_filter(d, table, where)                   # every setup: the hop's filter is what HOPS says
+        if not res["ok"]:
+            return res
     return {"ok": True, **status(d)}
 
 
@@ -277,7 +318,8 @@ def teardown(d: str, state: str = "") -> dict:
         if slot:
             c.execute("select pg_drop_replication_slot(%s)", (SLOT,))
         c.execute("DROP PUBLICATION IF EXISTS %s" % PUBLICATION)
-        c.execute("DROP EVENT TRIGGER IF EXISTS %s" % FULL_TRIGGER)
+        if not HOP:                                         # the trigger serves the default hop's schemas
+            c.execute("DROP EVENT TRIGGER IF EXISTS %s" % FULL_TRIGGER)
     return {"ok": True, "dropped_slot": slot}
 
 
@@ -375,7 +417,7 @@ def record(change: dict, sysid: str, host: str = "") -> dict:
     would share a key and all but one be dropped as already held. A first row keeps the key it always had."""
     seq = change.get("seq", 0)
     where = "%s:%s" % (sysid, change["lsn"]) + (":%d" % seq if seq else "")
-    opid = hashlib.sha256(where.encode()).hexdigest()[:32]
+    opid = hashlib.sha256(_seed(where).encode()).hexdigest()[:32]
     rec = {"operation_id": "iq:op:" + opid, "op": "cdc:" + change["op"], "decision": "captured",
             "service": SERVICE, "at": change["at"], "host": host, "table": change["table"],
             "lsn": change["lsn"], "commit_lsn": change["commit_lsn"], "xid": change["xid"],
@@ -390,7 +432,7 @@ def status_record(sysid: str, host: str, lsn: str, pending_bytes: int, kind: str
     turns it into the device's status (GherkinIq/Facet/Store/devices.py: seen, synced, pending, stale). It names no
     table, so apply.py never replays it."""
     at = at or datetime.now(timezone.utc).isoformat()
-    opid = hashlib.sha256(("%s:status:%s" % (sysid, at)).encode()).hexdigest()[:32]
+    opid = hashlib.sha256(_seed("%s:status:%s" % (sysid, at)).encode()).hexdigest()[:32]
     return {"operation_id": "iq:op:" + opid, "op": "cdc:status", "decision": "captured", "service": SERVICE,
             "at": at, "host": host, "table": "", "lsn": lsn, "commit_lsn": lsn, "pending_bytes": int(pending_bytes),
             "kind": kind}
@@ -459,7 +501,7 @@ class Streamer:
         out = self._cycle()
         self._beat(out)
         if self.state:                          # the last cycle, for the lag's reader (the Dashboard)
-            write_state(os.path.join(os.path.dirname(self.state), "cycle.json"),
+            write_state(os.path.join(os.path.dirname(self.state), "cycle%s.json" % ("-" + HOP if HOP else "")),
                         dict(out, at=datetime.now(timezone.utc).isoformat()))
         return out
 
@@ -658,7 +700,7 @@ def lag(d: str, state: str = "") -> dict:
     unshipped and no cycle in 5 minutes) | ok."""
     st = status(d)
     snap = read_state(state) if state else {}
-    last = read_state(os.path.join(os.path.dirname(state), "cycle.json")) if state else {}
+    last = read_state(os.path.join(os.path.dirname(state), "cycle%s.json" % ("-" + HOP if HOP else ""))) if state else {}
     cap = _bytes(st["wal_cap"])
     out = {"slot": st["slot"], "wal_level": st["wal_level"], "wal_cap": st["wal_cap"], "cap_bytes": cap,
            "tables": (st["publication"] or {}).get("tables", []),
@@ -688,7 +730,8 @@ def lag(d: str, state: str = "") -> dict:
 
 # -- the initial snapshot ---------------------------------------------------------------------------------
 def state_path() -> str:
-    return os.path.join(os.path.expanduser(os.environ.get("IQ_CDC_HOME", "~/.iq/cdc")), "snapshot.json")
+    return os.path.join(os.path.expanduser(os.environ.get("IQ_CDC_HOME", "~/.iq/cdc")),
+                        "snapshot%s.json" % ("-" + HOP if HOP else ""))
 
 
 def read_state(path: str) -> dict:
@@ -723,7 +766,7 @@ def snapshot_record(table: str, row: dict, sysid: str, snap: dict, host: str = "
     """A row as it stood at the snapshot. Its operationId is a function of the row's content, so re-running a
     snapshot over an unchanged row is the same key (dedup), and a row changed since is a new record."""
     body = json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
-    opid = hashlib.sha256(("%s:snapshot:%s:%s" % (sysid, table, body)).encode()).hexdigest()[:32]
+    opid = hashlib.sha256(_seed("%s:snapshot:%s:%s" % (sysid, table, body)).encode()).hexdigest()[:32]
     return {"operation_id": "iq:op:" + opid, "op": "cdc:snapshot", "decision": "captured", "service": SERVICE,
             "at": snap["at"], "host": host, "table": table, "lsn": snap["lsn"], "commit_lsn": snap["lsn"],
             "xid": None, "new": row, "old": None, "snapshot": snap["snapshot"]}
@@ -847,6 +890,8 @@ def restart(pgdata: str):
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser(prog="iq-cdc", description="Stream the box's Postgres to the IQ Server while it is up.")
+    p.add_argument("--hop", default="", choices=[""] + sorted(HOPS),
+                   help="a named hop with its own slot, e.g. proxy (the domain's token status to the proxy)")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("setup")
     s.add_argument("tables", nargs="*", help="schema.table to capture (default: every table in public)")
@@ -870,6 +915,14 @@ def main(argv=None) -> int:
         r = sub.add_parser(name)
         r.add_argument("--interval", type=float, default=10.0)
     a = p.parse_args(argv)
+    use_hop(a.hop)
+    widen = a.cmd in ("columns", "publish") or (a.cmd == "filter" and (a.table or a.reset or a.clear))
+    if a.hop and widen:
+        print("[iq-cdc] the %s hop captures what HOPS fixes; it is not narrowed or widened here" % a.hop)
+        return 2
+    if a.hop and a.cmd == "setup" and a.tables:
+        print("[iq-cdc] the %s hop's tables are fixed (%s)" % (a.hop, ", ".join(HOPS[a.hop]["tables"])))
+        return 2
     d = dsn()
     if a.cmd == "setup":
         res = setup(d, a.tables, restart_cmd=(lambda: restart(os.path.expanduser(os.environ.get("IQ_PGDATA", "~/.iq/pg"))))
@@ -924,7 +977,7 @@ def main(argv=None) -> int:
     identity_map = _bridge("identity_map")
     st = status(d)
     if not st["slot"]:
-        print("[iq-cdc] no slot %s -- run: iq-cdc.sh setup" % SLOT)
+        print("[iq-cdc] no slot %s -- run: iq-cdc.sh %ssetup" % (SLOT, "--hop %s " % HOP if HOP else ""))
         return 2
     if st["slot"]["wal_status"] == "lost":
         print("[iq-cdc] slot %s lost its WAL (cap %s exceeded) -- teardown and setup again" % (SLOT, st["wal_cap"]))
@@ -934,7 +987,7 @@ def main(argv=None) -> int:
         transport = _bridge("relay").HttpRelayTransport(base, bearer=creds[0])
         st = Streamer(c, up=PairedProbe(base, tokenizer, transport), deid=Deidentifier(tokenizer),
                       transport=transport, host=os.uname().nodename,
-                      state=state_path(), heartbeat=a.cmd != "snapshot")
+                      state=state_path(), heartbeat=a.cmd != "snapshot" and not HOP)   # the device's beat: its own hop
         if a.cmd == "snapshot":
             res = snapshot(d, st, state_path())
             print(json.dumps(res, indent=2))

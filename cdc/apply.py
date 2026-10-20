@@ -25,6 +25,10 @@ how a row is matched, how json is held -- stays in its adapter (dataplane.Postgr
 
     python apply.py lake <target-dsn> <target-schema> --host <box> [--schema ducklake] [--blobs <dir>]
                                                           [--domain <iq: IRI>]
+    python apply.py plane <target-dsn> --host <box> [--hop proxy] [--prefix iq:token-status:] [--blobs <dir>]
+
+`plane` is the proxy's end of the domain's second hop (cdc.py --hop proxy): the domain's token-status records, put
+on the proxy's routing store as the values they are (put_records) -- never a replica, which could truncate it.
 
 A device syncing to its domain is the same hop: with --domain, the device's heartbeat (cdc.status_record) and what
 the replay made of its records become the device's status in the domain (devices.observe).
@@ -137,6 +141,50 @@ def apply(rep, records, *, host: str, source_schema: str) -> dict:
             "watermark": cdc.lsn_text(mark) if mark >= 0 else None}
 
 
+PLANE_TABLE = "public.plane_datum"
+
+
+def _array(v) -> list:
+    """A text[] as CDC ships it (Postgres's literal, e.g. {a,b}) or already a list."""
+    if isinstance(v, list):
+        return v
+    inner = (v or "{}")[1:-1]
+    return [x.strip().strip('"') for x in inner.split(",")] if inner else []
+
+
+def put_records(plane, records, *, host: str, prefix: str) -> dict:
+    """A hop of the plane's own table (cdc --hop proxy) replayed as values: every inserted or snapshot row of
+    public.plane_datum under `prefix` is put on `plane` as the Datum it is. A plane row never changes, so a put is
+    the whole replay: the same value again is a no-op, nothing is truncated, and no watermark is needed. A row
+    outside `prefix` is not put (skipped: the proxy takes only what it may hold); an update or delete is refused
+    (a plane row does not change). -> {ok, put, already, skipped, refused: [...]}"""
+    sys.path.insert(0, str(_store_dir()))
+    import dataplane
+    ours = sorted((r for r in records if r.get("service") == cdc.SERVICE and r.get("host") == host
+                   and r.get("table") == PLANE_TABLE), key=_key)
+    out = {"ok": True, "put": 0, "already": 0, "skipped": 0, "refused": []}
+    for rec in ours:
+        if rec["op"] not in ("cdc:insert", "cdc:snapshot"):
+            out["refused"].append("%s at %s: a plane row does not change" % (rec["op"], rec["lsn"]))
+            continue
+        row = rec["new"]
+        if not str(row.get("iri", "")).startswith(prefix):
+            out["skipped"] += 1
+            continue
+        d = dataplane.Datum(row["iri"], row["tier"], row["body"], row["media_type"], tuple(_array(row["derived_from"])),
+                            row["recorded_at"])
+        held = plane.get(d.iri, "cdc-put")
+        r = plane.put(d, "cdc-put")
+        if not r.ok:
+            out["refused"].append("%s: %s" % (d.iri, r.reason))
+        elif held.ok and held.found:
+            out["already"] += 1
+        else:
+            out["put"] += 1
+    out["ok"] = not out["refused"]
+    return out
+
+
 def _plane(target: str, env: dict | None = None):
     """The global side's data plane, bound to the target store (dataplane.from_env names the store, not us)."""
     sys.path.insert(0, str(_store_dir()))
@@ -182,16 +230,28 @@ def _store_dir():
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="apply.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("what", choices=["lake"])
+    ap.add_argument("what", choices=["lake", "plane"])
     ap.add_argument("target_dsn", help="the global store, as the data plane's record role binds it")
-    ap.add_argument("target_schema")
+    ap.add_argument("target_schema", nargs="?", help="lake: the schema the catalog is replayed into")
     ap.add_argument("--host", required=True, help="the box whose records to replay (the record's `host`)")
     ap.add_argument("--schema", default="ducklake", help="the source schema on the box")
     ap.add_argument("--blobs", help="a local directory of records (default: the iq-blobs bucket, S3 creds)")
     ap.add_argument("--domain", help="the domain's iq: IRI, when this hop is a device syncing to its domain: the"
                                      " device's status is recorded (GherkinIq/Facet/Store/devices.py)")
+    ap.add_argument("--hop", default="proxy", help="plane: the hop whose records to put (cdc.py --hop)")
+    ap.add_argument("--prefix", default="iq:token-status:", help="plane: only IRIs under this prefix are put")
     a = ap.parse_args(argv)
+    if a.what == "lake" and not a.target_schema:
+        ap.error("lake needs a target schema")
     store = DirStore(a.blobs) if a.blobs else _s3()
+    if a.what == "plane":
+        cdc.use_hop(a.hop)
+        sys.path.insert(0, str(_store_dir()))
+        import dataplane
+        r = put_records(dataplane.from_env({"IQ_RECORD_DSN": a.target_dsn}, roles=("record",)), records_in(store),
+                        host=a.host, prefix=a.prefix)
+        print(json.dumps(r))
+        return 0 if r["ok"] else 1
     print(json.dumps(prepare_lake(a.target_dsn, a.target_schema)))
     recs = records_in(store)
     rep = replica(a.target_dsn, a.target_schema)
