@@ -160,5 +160,15 @@ Superset does. Plus `cdc.feature` "Every row of a COPY reaches the server", whic
 scenarios in all. Not live: the box's publication does not include `ducklake` yet, and nothing runs `apply.py`
 against the global cluster.
 
+**A domain's own slot onto the cluster (2026-10-22).** A User/Group domain whose Postgres is its own cluster has
+the default `iq_cdc` slot there, publishing its `plane_datum`. `apply.py domain <cluster-dsn> --host <domain>
+--namespace <u-|g-...>` (`apply_domain`) puts every plane row it shipped on the cluster's record,
+`dataplane.ClusterAdapter`: one row per `(owner, iri)`, the owner computed from the IRI, which is the distribution
+column once the table is distributed on Citus. The puts go through a plane bound to the domain's namespace, so a row
+of another namespace is refused (`not_my_namespace`) and never lands. Restoring a domain is
+`ClusterAdapter.owned_by(ns)`. As with the proxy hop these are puts: idempotent, with no watermark. Covered by
+UC_Group's `features/domain.feature` (a throwaway pgembed as the domain, its slot shipped and applied). Not run
+against the global cluster, and `create_distributed_table` on `owner` is not done.
+
 **Next.** Run `apply.py` where it reaches both the blobs and the global cluster. Narrow its read of
 `auth/events/` to the days past the watermark, because today it lists the whole prefix.

@@ -26,9 +26,16 @@ how a row is matched, how json is held -- stays in its adapter (dataplane.Postgr
     python apply.py lake <target-dsn> <target-schema> --host <box> [--schema ducklake] [--blobs <dir>]
                                                           [--domain <iq: IRI>]
     python apply.py plane <target-dsn> --host <box> [--hop proxy] [--prefix iq:token-status:] [--blobs <dir>]
+    python apply.py domain <cluster-dsn> --host <domain> --namespace <u-|g-...> [--blobs <dir>]
 
 `plane` is the proxy's end of the domain's second hop (cdc.py --hop proxy): the domain's token-status records, put
 on the proxy's routing store as the values they are (put_records) -- never a replica, which could truncate it.
+
+`domain` is the cluster's end of a User/Group domain's own slot (UC_Group slice 7: the domain's Postgres is its
+own cluster, so its slot is the default `iq_cdc`): every plane row the domain shipped, put on the cluster's record
+(dataplane.ClusterAdapter, one row per (owner, IRI), the owner its distribution column) through a plane bound to the
+domain's namespace -- so a domain that ships another namespace's row has it refused (not_my_namespace), and
+restoring a domain is selecting its owner (ClusterAdapter.owned_by). Puts, as `plane`: idempotent, no watermark.
 
 A device syncing to its domain is the same hop: with --domain, the device's heartbeat (cdc.status_record) and what
 the replay made of its records become the device's status in the domain (devices.observe).
@@ -185,6 +192,20 @@ def put_records(plane, records, *, host: str, prefix: str) -> dict:
     return out
 
 
+def cluster_plane(target: str, namespace: str, table: str = "cluster_datum", admit=None):
+    """The cluster's record as one domain may write it: a plane over dataplane.ClusterAdapter, bound to the
+    domain's namespace (it refuses every other: not_my_namespace)."""
+    sys.path.insert(0, str(_store_dir()))
+    import dataplane
+    return dataplane.Plane([dataplane.ClusterAdapter(target, table)], admit, owner=namespace)
+
+
+def apply_domain(target: str, records, *, host: str, namespace: str, table: str = "cluster_datum",
+                 admit=None) -> dict:
+    """A domain's slot replayed onto the cluster: put_records through cluster_plane. -> put_records' answer."""
+    return put_records(cluster_plane(target, namespace, table, admit), records, host=host, prefix="iq:")
+
+
 def _plane(target: str, env: dict | None = None):
     """The global side's data plane, bound to the target store (dataplane.from_env names the store, not us)."""
     sys.path.insert(0, str(_store_dir()))
@@ -230,7 +251,7 @@ def _store_dir():
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="apply.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("what", choices=["lake", "plane"])
+    ap.add_argument("what", choices=["lake", "plane", "domain"])
     ap.add_argument("target_dsn", help="the global store, as the data plane's record role binds it")
     ap.add_argument("target_schema", nargs="?", help="lake: the schema the catalog is replayed into")
     ap.add_argument("--host", required=True, help="the box whose records to replay (the record's `host`)")
@@ -240,10 +261,17 @@ def main(argv=None) -> int:
                                      " device's status is recorded (GherkinIq/Facet/Store/devices.py)")
     ap.add_argument("--hop", default="proxy", help="plane: the hop whose records to put (cdc.py --hop)")
     ap.add_argument("--prefix", default="iq:token-status:", help="plane: only IRIs under this prefix are put")
+    ap.add_argument("--namespace", help="domain: the domain's namespace (u-<k> or g-<h>); its rows only")
     a = ap.parse_args(argv)
     if a.what == "lake" and not a.target_schema:
         ap.error("lake needs a target schema")
+    if a.what == "domain" and not a.namespace:
+        ap.error("domain needs --namespace")
     store = DirStore(a.blobs) if a.blobs else _s3()
+    if a.what == "domain":
+        r = apply_domain(a.target_dsn, records_in(store), host=a.host, namespace=a.namespace)
+        print(json.dumps(r))
+        return 0 if r["ok"] else 1
     if a.what == "plane":
         cdc.use_hop(a.hop)
         sys.path.insert(0, str(_store_dir()))
