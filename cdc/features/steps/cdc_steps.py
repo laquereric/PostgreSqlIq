@@ -45,6 +45,9 @@ class _Server:
         return self.relay.have(keys)
 
     def send(self, records):
+        if getattr(self, "delay", 0):           # a far server: each send takes this long (a busy box outpaces it)
+            import time
+            time.sleep(self.delay)
         self.sends += 1
         if self.refuse_next > 0 or self.sends == self.refuse_nth:
             self.refuse_next -= 1
@@ -784,3 +787,62 @@ def _ready_down(context, reason):
 @then('readying it is refused as "{reason}"')
 def _ready_refused(context, reason):
     assert not context.ready["ok"] and context.ready["reason"] == reason, context.ready
+
+
+
+# -- a busy box: the snapshot's drain ends where it began ----------------------------------------------------
+@when("a writer inserts a note every 20ms while the snapshot runs")
+def _busy_snapshot(context):
+    import threading
+    import time
+    stop, done = threading.Event(), {}
+
+    def writer():
+        n = 1000
+        with psycopg.connect(context.dsn, autocommit=True) as c:
+            while not stop.is_set():
+                c.execute("INSERT INTO notes (id, body) VALUES (%s, 'busy')", (n,))
+                n += 1
+                time.sleep(0.02)
+
+    def snap():
+        done["snap"] = cdc.snapshot(context.dsn, _streamer(context), context.state)
+    context.server.delay = 0.1                  # a cycle outlasts the writer's interval, as on the box over HTTPS
+    w = threading.Thread(target=writer, daemon=True)
+    w.start()
+    time.sleep(0.2)
+    t = threading.Thread(target=snap, daemon=True)
+    started = time.time()
+    t.start()
+    t.join(60)
+    context.busy_took = time.time() - started if not t.is_alive() else None
+    stop.set()
+    w.join(5)
+    context.server.delay = 0
+    context.snap = done.get("snap")
+
+
+@then("the snapshot finished within {s:d} seconds")
+def _busy_done(context, s):
+    assert context.busy_took is not None and context.busy_took < s, "the drain never ended"
+    assert context.snap["ok"], context.snap
+
+
+@when("the streamer runs until the slot is empty")
+def _until_empty(context):
+    for _ in range(50):
+        out = _streamer(context).cycle()
+        assert not out.get("error"), out
+        if not out["transactions"]:
+            return
+    raise AssertionError("the slot never emptied")
+
+
+@then("every note in the table reached the server, none twice as the same op")
+def _every_note_once(context):
+    ids = sorted(r[0] for r in _sql(context, "SELECT id FROM notes"))
+    recs = [(r["op"], r["new"]["id"]) for r in context.server.records()
+            if r["op"] in ("cdc:insert", "cdc:snapshot") and r.get("table") == "public.notes"]
+    assert sorted({i for _, i in recs}) == ids, (len({i for _, i in recs}), len(ids))
+    dupes = sorted({x for x in recs if recs.count(x) > 1})
+    assert not dupes, dupes[:10]                # an insert, or a snapshot row, of one note never twice

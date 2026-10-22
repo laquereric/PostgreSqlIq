@@ -193,6 +193,14 @@ never did (`--snapshot` runs it at once, with the server up). A healthy slot is 
 kept, streams the next insert, and snapshots the rest; three mutants caught. A rebuilt slot that nothing reads is
 lost again in time: it holds only while a streamer runs (or a snapshot follows soon enough).
 
+**The snapshot on a busy box (2026-10-22).** The snapshot's drain stopped only when a cycle found nothing to
+ship. On the box -- the gate's replay rows, other sessions' scratch tables, each cycle a slow HTTPS round trip -- a
+cycle never found nothing, so the drain never ended, the snapshot never began, and the WAL backlog grew (seen live:
+50 MB to 118 MB in 15 minutes). The drain now ends at the WAL position flushed when it began: what commits after it
+is in the snapshot's rows (visible, so the stream skips it) or comes after them (streamed). `cdc.feature` holds it
+with a writer inserting every 20 ms and a server whose every send takes 100 ms: the snapshot ends within the minute
+and every note reaches the server, none twice as the same op; the old drain fails the same scenario.
+
 **The streamer as a LaunchAgent (2026-10-22).** `iq-cdc.sh serve` is `run` after readying the slot
 (`cdc.prepare`): a lost slot rebuilt, a needed or incomplete snapshot run, a down IQ Server waited out (`server_down`,
 tried again every interval); no slot is never made (`no_slot`: setup is by hand). `service/iq-cdc-launchd.sh` runs

@@ -808,7 +808,8 @@ def snapshot_record(table: str, row: dict, sysid: str, snap: dict, host: str = "
 def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: int = 1000) -> dict:
     """The rows that existed before the slot, shipped once, in line with the stream:
       1. mark the state running (the streamer pauses; a failure leaves it so, and a re-run starts again);
-      2. drain the slot through `streamer` (the snapshot's own drain);
+      2. drain the slot through `streamer` (the snapshot's own drain) up to the WAL position flushed when the drain
+         began -- not until a cycle finds nothing, which a box written to all the time never reaches;
       3. read every published table in ONE repeatable-read transaction, recording pg_current_snapshot() and the
          WAL position, and ship the rows (have/missing, batches);
       4. mark it done with that snapshot: the streamer then advances over every transaction visible in it
@@ -820,12 +821,13 @@ def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: i
         return {"ok": False, "server": "down", "http": http}
     write_state(state, {"status": "running", "started": datetime.now(timezone.utc).isoformat()})
     streamer.draining = True
-    try:
+    target = lsn_int(flushed(streamer.c))      # the drain ends here: on a busy box the slot is never empty, and
+    try:                                        # what commits after this is the snapshot's (visible) or the stream's
         while True:
             res = streamer.cycle()
             if res.get("error") or res["server"] != "up":
                 return {"ok": False, "stage": "drain", **res}
-            if not res["transactions"]:
+            if not res["transactions"] or (res.get("advanced") and lsn_int(res["advanced"]) >= target):
                 break
     finally:
         streamer.draining = False

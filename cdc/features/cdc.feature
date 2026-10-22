@@ -229,6 +229,14 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     Then rebuilding the slot is refused as "not_lost"
     And rebuilding it by force makes a new slot and asks for a snapshot
 
+  Scenario: On a box written to all the time, the snapshot's drain stops where it began, and every row arrives
+    Given a notes table holding 3 notes before CDC is set up
+    And the IQ Server is up
+    When a writer inserts a note every 20ms while the snapshot runs
+    Then the snapshot finished within 60 seconds
+    When the streamer runs until the slot is empty
+    Then every note in the table reached the server, none twice as the same op
+
   Scenario: The service readies a lost slot before it streams: rebuilt, snapshotted, then streaming
     Given CDC is set up on a fresh notes table
     And the IQ Server is up
