@@ -167,8 +167,10 @@ the default `iq_cdc` slot there, publishing its `plane_datum`. `apply.py domain 
 column once the table is distributed on Citus. The puts go through a plane bound to the domain's namespace, so a row
 of another namespace is refused (`not_my_namespace`) and never lands. Restoring a domain is
 `ClusterAdapter.owned_by(ns)`. As with the proxy hop these are puts: idempotent, with no watermark. Covered by
-UC_Group's `features/domain.feature` (a throwaway pgembed as the domain, its slot shipped and applied). Not run
-against the global cluster, and `create_distributed_table` on `owner` is not done.
+UC_Group's `features/domain.feature` (a throwaway pgembed as the domain, its slot shipped and applied). On the
+Citus cluster the table is `iq.cluster_datum`, distributed by `owner` (remote `schema.sql`; remote
+`features/domains.feature`, 2026-10-22: each domain's rows on the one worker holding its shard, a domain's read a
+single-shard query, restore by owner, a foreign row refused).
 
 **Next.** Run `apply.py` where it reaches both the blobs and the global cluster. Narrow its read of
 `auth/events/` to the days past the watermark, because today it lists the whole prefix.

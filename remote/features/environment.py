@@ -70,7 +70,7 @@ TOPOLOGY = {"single": "a coordinator and two workers on one vc2-2c-4gb, by port 
 TITLE = {"acid": "Citus against MarkLogic's transaction guarantees", "shacl": "SHACL enforced at commit on Citus",
          "inference": "Scoped inference at query time on Citus", "search": "BM25 over the distributed record",
          "gate": "The gate as the cluster's only writer", "backup": "Backups to Vultr, restorable to one moment",
-         "tiered": "Hot Postgres, cold Iceberg on Citus"}
+         "tiered": "Hot Postgres, cold Iceberg on Citus", "domains": "The cluster's record, distributed by owner"}
 
 
 def _report(context, feature):

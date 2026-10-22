@@ -261,6 +261,28 @@ END
 $fn$;
 
 -- iq reads and writes; the schema is postgres's (applied over ssh), so no DDL is in the client's reach
+-- the cluster's record (UC_Group: a domain's own slot onto the cluster, cdc apply.py domain): one row per
+-- (owner, iri), the owner computed from the IRI (DataPlatform rule 11) and the table DISTRIBUTED BY IT (rule 3), so a
+-- domain's rows sit on one shard together, a domain's read is a single-shard (router) query, and restoring a domain
+-- is one select by owner. Written through dataplane.ClusterAdapter only; not co-located with iq.datum (keyed by iri).
+CREATE TABLE IF NOT EXISTS iq.cluster_datum (
+    owner        text NOT NULL,
+    iri          text NOT NULL,
+    tier         text NOT NULL,
+    media_type   text NOT NULL,
+    body         text NOT NULL,
+    derived_from text[] NOT NULL,
+    recorded_at  text NOT NULL,
+    PRIMARY KEY (owner, iri)
+);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.cluster_datum'::regclass) THEN
+        PERFORM create_distributed_table('iq.cluster_datum', 'owner');
+    END IF;
+END $$;
+
 GRANT USAGE ON SCHEMA iq TO iq;
 GRANT SELECT, INSERT, UPDATE, DELETE ON iq.datum, iq.quad, iq.vocab TO iq;
+GRANT SELECT, INSERT ON iq.cluster_datum TO iq;
 GRANT EXECUTE ON FUNCTION iq.entail(), iq.entail(text[]), iq.entail_fixpoint(), iq.closure_table() TO iq;
