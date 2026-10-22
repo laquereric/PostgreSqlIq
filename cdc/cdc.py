@@ -88,6 +88,11 @@ HOPS = {
     # verify a token without knowing whose it is. Its own slot, so neither hop waits on the other; its tables and
     # row filter are fixed here, never widened from the command line.
     "proxy": {"tables": ("public.plane_datum",), "where": {"public.plane_datum": "iri LIKE 'iq:token-status:%'"}},
+    # A User/Group domain to the global cluster (apply.py ship): its plane rows, each exactly as written. Its own
+    # slot, so it never takes the default hop's changes; the row filter is the domain's namespace, set by
+    # apply.py ship-setup (apply.namespace_filter) -- the one hop whose filter is not fixed here, because a box is
+    # one namespace's domain and which one is the box's to say.
+    "cluster": {"tables": ("public.plane_datum",), "where": {}},
 }
 WAL_CAP = "1GB"
 BATCH = 200                     # records per POST /events

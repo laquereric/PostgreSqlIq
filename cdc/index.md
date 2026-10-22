@@ -181,8 +181,22 @@ between the put and the advance ships them again, and a put of the same value is
 namespace (`namespace_filter`, a row filter on `plane_datum`), so the domain's accounts and identity map are never
 decoded and never leave the box. Covered by UC_Group's `domain.feature` (a throwaway pgembed domain: a cycle against
 an unreachable cluster leaves the slot whole, the next ships it and empties it, a later write ships alone) and remote
-`domains.feature` against the Vultr cluster (5 rows, then 2 more, nothing of another namespace). Running it as a
-service for a live domain is not set up yet.
+`domains.feature` against the Vultr cluster (5 rows, then 2 more, nothing of another namespace). 
+
+**As a service (2026-10-22).** The `cluster` hop (`cdc.HOPS`) is the shipper's own slot, `iq_cdc_cluster`, so it
+never takes the default hop's changes; its row filter is the domain's namespace, set by `apply.py ship-setup`.
+`ship --resync` first puts every row of the namespace again (what went by while a slot was away), and a lost slot
+(WAL past the cap while the cluster was parked) is made again and resynced. `--give-up N` ends a run after N
+unreachable cycles so a service starts again with a new tunnel; a cycle with nothing to ship never touches the
+cluster, so a quiet domain never keeps the cluster from parking. `--table` names the cluster's table
+(`iq.cluster_datum` on Citus). `service/iq-ship-launchd.sh` is the LaunchAgent's entry: an SSH tunnel to the
+coordinator (UC_Citus topology), the `iq` password read over ssh into `PGPASSWORD`, `ship-setup`, then `ship
+--resync` every `IQ_SHIP_INTERVAL` seconds (30), the tunnel taken down with the shipper however it ends;
+`--print` shows its configuration. `service/install-ship.sh u-<k>|g-<h>` installs `com.iq.cdc-ship`
+(KeepAlive, ThrottleInterval 300; `--remove`). Remote `domains.feature` runs the script itself against the Vultr
+cluster with a throwaway domain: resync of 5 rows, 2 more shipped as written, the tunnel gone with it. Not
+installed on the box: which namespace the box is the domain of is the user's to say, and the box's records hold
+no `u-`/`g-` namespace rows yet (its record IRIs predate rule 11).
 
 **Next.** Run `apply.py` where it reaches both the blobs and the global cluster. Narrow its read of
 `auth/events/` to the days past the watermark, because today it lists the whole prefix.

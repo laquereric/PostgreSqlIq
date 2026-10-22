@@ -27,7 +27,9 @@ how a row is matched, how json is held -- stays in its adapter (dataplane.Postgr
                                                           [--domain <iq: IRI>]
     python apply.py plane <target-dsn> --host <box> [--hop proxy] [--prefix iq:token-status:] [--blobs <dir>]
     python apply.py domain <cluster-dsn> --host <domain> --namespace <u-|g-...> [--blobs <dir>]
-    python apply.py ship <cluster-dsn> --domain-dsn <dsn> --namespace <u-|g-...> [--interval 5] [--once]
+    python apply.py ship-setup --domain-dsn <dsn> --namespace <u-|g-...>      the cluster hop's slot, narrowed
+    python apply.py ship <cluster-dsn> --domain-dsn <dsn> --namespace <u-|g-...> [--interval 5] [--once] [--resync]
+                                                                                    [--give-up N]
 
 `plane` is the proxy's end of the domain's second hop (cdc.py --hop proxy): the domain's token-status records, put
 on the proxy's routing store as the values they are (put_records) -- never a replica, which could truncate it.
@@ -235,7 +237,15 @@ def ship_domain(domain_dsn: str, cluster_dsn: str, namespace: str, *, limit: int
     with psycopg.connect(domain_dsn, autocommit=True) as c:
         sysid = cdc.system_id(c)
         dec, records, done = cdc.Decoder(), [], None
-        for lsn, _x, data in cdc.peek(c, limit):
+        try:
+            changes = cdc.peek(c, limit)
+        except psycopg.Error as exc:
+            msg = str(exc)
+            if "does not exist" in msg or "can no longer get changes" in msg or "invalidated" in msg:
+                return {"ok": False, "reason": "slot_lost", "detail": msg.splitlines()[0][:200], "shipped": 0,
+                        "advanced": None}
+            raise
+        for lsn, _x, data in changes:
             got = dec.feed(lsn, data)
             if isinstance(got, list):
                 records += [cdc.record(ch, sysid, namespace) for ch in got]
@@ -256,16 +266,60 @@ def ship_domain(domain_dsn: str, cluster_dsn: str, namespace: str, *, limit: int
         return {**r, "shipped": len(records), "advanced": done, "pending_bytes": cdc.pending_bytes(c)}
 
 
+def resync_domain(domain_dsn: str, cluster_dsn: str, namespace: str, *, table: str = "cluster_datum",
+                  source: str = PLANE_TABLE, admit=None) -> dict:
+    """Every row of the namespace the domain holds, put on the cluster again: what a lost slot (WAL past its cap
+    while the cluster was away) or a new slot did not carry. Idempotent: a row the cluster holds is `already`.
+    -> {ok, put, already, refused}"""
+    import psycopg
+    sys.path.insert(0, str(_store_dir()))
+    import dataplane
+    plane = cluster_plane(cluster_dsn, namespace, table, admit)
+    out = {"ok": True, "put": 0, "already": 0, "refused": []}
+    with psycopg.connect(domain_dsn) as c:
+        rows = c.execute("SELECT iri, tier, body, media_type, derived_from, recorded_at FROM %s WHERE %s ORDER BY iri"
+                         % (source, namespace_filter(namespace))).fetchall()
+    for iri, tier, body, media, derived, at in rows:
+        d = dataplane.Datum(iri, tier, body, media, tuple(derived or ()), at)
+        held = plane.get(iri, "cdc-resync")
+        r = plane.put(d, "cdc-resync")
+        if not r.ok:
+            out["refused"].append("%s: %s" % (iri, r.reason))
+        elif held.ok and held.found:
+            out["already"] += 1
+        else:
+            out["put"] += 1
+    out["ok"] = not out["refused"]
+    return out
+
+
+def ship_setup(domain_dsn: str, namespace: str, restart_cmd=None) -> dict:
+    """The cluster hop's slot on the domain's Postgres (cdc --hop cluster: iq_cdc_cluster), narrowed to the
+    namespace. Idempotent. Switches this process to the cluster hop."""
+    cdc.use_hop("cluster")
+    held = cdc.setup(domain_dsn, restart_cmd=restart_cmd)
+    if not held.get("ok"):
+        return held
+    return cdc.set_filter(domain_dsn, PLANE_TABLE, namespace_filter(namespace))
+
+
 def run_ship(domain_dsn: str, cluster_dsn: str, namespace: str, *, interval: float = 5.0, cycles: int = 0,
-             limit: int = 1000, table: str = "cluster_datum", log=print) -> dict:
+             limit: int = 1000, table: str = "cluster_datum", give_up: int = 0, on_lost=None, log=print) -> dict:
     """Ship continuously: a cycle every `interval` seconds (at once again while a cycle fills its `limit`), for
-    `cycles` cycles (0: until stopped). Each cycle's answer is logged; the last is returned."""
+    `cycles` cycles (0: until stopped). After `give_up` cycles in a row that could not reach the cluster it returns
+    (a service then starts again, with a new tunnel). A lost slot calls `on_lost` (make the slot again and resync)
+    and goes on. Each cycle's answer is logged; the last is returned."""
     import time
-    n, last = 0, {}
+    n, last, away = 0, {}, 0
     while not cycles or n < cycles:
         last = ship_domain(domain_dsn, cluster_dsn, namespace, limit=limit, table=table)
         n += 1
         log(json.dumps(last))
+        if last.get("reason") == "slot_lost" and on_lost is not None:
+            log(json.dumps({"slot_lost": True, "reopened": on_lost()}, default=str))
+        away = away + 1 if last.get("reason") == "cluster_unreachable" else 0
+        if give_up and away >= give_up:
+            return last
         if not (last.get("ok") and last.get("shipped", 0) >= limit):
             time.sleep(interval if (not cycles or n < cycles) else 0)
     return last
@@ -316,10 +370,10 @@ def _store_dir():
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="apply.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("what", choices=["lake", "plane", "domain", "ship"])
-    ap.add_argument("target_dsn", help="the global store, as the data plane's record role binds it")
+    ap.add_argument("what", choices=["lake", "plane", "domain", "ship", "ship-setup"])
+    ap.add_argument("target_dsn", nargs="?", help="the global store, as the data plane's record role binds it")
     ap.add_argument("target_schema", nargs="?", help="lake: the schema the catalog is replayed into")
-    ap.add_argument("--host", required=True, help="the box whose records to replay (the record's `host`)")
+    ap.add_argument("--host", help="lake, plane, domain: the box whose records to replay (the record's `host`)")
     ap.add_argument("--schema", default="ducklake", help="the source schema on the box")
     ap.add_argument("--blobs", help="a local directory of records (default: the iq-blobs bucket, S3 creds)")
     ap.add_argument("--domain", help="the domain's iq: IRI, when this hop is a device syncing to its domain: the"
@@ -330,19 +384,43 @@ def main(argv=None) -> int:
     ap.add_argument("--domain-dsn", help="ship: the domain's Postgres, whose slot is shipped")
     ap.add_argument("--interval", type=float, default=5.0, help="ship: seconds between cycles")
     ap.add_argument("--once", action="store_true", help="ship: one cycle")
+    ap.add_argument("--resync", action="store_true", help="ship: put every row of the namespace again first")
+    ap.add_argument("--give-up", type=int, default=0, help="ship: return after N unreachable cycles in a row")
+    ap.add_argument("--table", default="cluster_datum",
+                    help="domain, ship: the cluster's record table (iq.cluster_datum on the Citus cluster)")
     a = ap.parse_args(argv)
     if a.what == "lake" and not a.target_schema:
         ap.error("lake needs a target schema")
-    if a.what in ("domain", "ship") and not a.namespace:
+    if a.what in ("lake", "plane", "domain") and not a.host:
+        ap.error("%s needs --host" % a.what)
+    if a.what in ("domain", "ship", "ship-setup") and not a.namespace:
         ap.error("%s needs --namespace" % a.what)
+    if a.what in ("ship", "ship-setup") and not a.domain_dsn:
+        ap.error("%s needs --domain-dsn" % a.what)
+    if a.what != "ship-setup" and not a.target_dsn:
+        ap.error("%s needs the target DSN" % a.what)
+    if a.what == "ship-setup":
+        r = ship_setup(a.domain_dsn, a.namespace)
+        print(json.dumps(r, default=str))
+        return 0 if r.get("ok") else 1
     if a.what == "ship":
-        if not a.domain_dsn:
-            ap.error("ship needs --domain-dsn")
-        r = run_ship(a.domain_dsn, a.target_dsn, a.namespace, interval=a.interval, cycles=1 if a.once else 0)
+        cdc.use_hop("cluster")                      # the service's slot, never the default hop's
+
+        def reopen():
+            cdc.teardown(a.domain_dsn)
+            return {"setup": ship_setup(a.domain_dsn, a.namespace).get("ok"),
+                    "resync": resync_domain(a.domain_dsn, a.target_dsn, a.namespace, table=a.table)}
+        if a.resync:
+            try:
+                print(json.dumps({"resync": resync_domain(a.domain_dsn, a.target_dsn, a.namespace, table=a.table)}))
+            except Exception as exc:  # noqa: BLE001 -- an unreachable cluster: the cycles say so and give up
+                print(json.dumps({"resync": {"ok": False, "detail": str(exc).splitlines()[0][:200]}}))
+        r = run_ship(a.domain_dsn, a.target_dsn, a.namespace, interval=a.interval, cycles=1 if a.once else 0,
+                     table=a.table, give_up=a.give_up, on_lost=reopen)
         return 0 if r.get("ok") else 1
     store = DirStore(a.blobs) if a.blobs else _s3()
     if a.what == "domain":
-        r = apply_domain(a.target_dsn, records_in(store), host=a.host, namespace=a.namespace)
+        r = apply_domain(a.target_dsn, records_in(store), host=a.host, namespace=a.namespace, table=a.table)
         print(json.dumps(r))
         return 0 if r["ok"] else 1
     if a.what == "plane":

@@ -197,3 +197,69 @@ def step_more_held(context, n):
     assert len(ClusterAdapter(_dsn(context), TABLE).owned_by(GROUP)) == n
     again = apply.ship_domain(context.domain_dsn, _dsn(context), GROUP, table=TABLE)
     assert again["ok"] and again["shipped"] == 0, again
+
+
+SERVICE = REMOTE.parent / "cdc" / "service" / "iq-ship-launchd.sh"
+
+
+@when("the service script ships that domain's namespace, every second")
+def step_service(context):
+    import os
+    import signal
+    import subprocess
+    env = {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "IQ_SHIP_NAMESPACE": GROUP,
+           "IQ_SHIP_DOMAIN_DSN": context.domain_dsn, "IQ_SHIP_INTERVAL": "1"}
+    import tempfile
+    context.ship_log = Path(tempfile.mkstemp(prefix="iq-ship-", suffix=".log")[1])
+    context.add_cleanup(context.ship_log.unlink, True)
+    log = open(context.ship_log, "ab")
+    context.service = subprocess.Popen(["/bin/zsh", str(SERVICE)], env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+
+    def stop():
+        if context.service.poll() is None:
+            os.killpg(context.service.pid, signal.SIGTERM)
+            context.service.wait(10)
+    context.add_cleanup(stop)
+
+
+def _within(context, n, seconds=60):
+    import time
+    adapter = ClusterAdapter(_dsn(context), TABLE)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if len(adapter.owned_by(GROUP)) >= n:
+            return adapter
+        assert context.service.poll() is None, "the service ended: %s" % context.ship_log.read_text()[-1500:]
+        time.sleep(1)
+    raise AssertionError("the cluster holds %d of %d; the service said: %s"
+                         % (len(adapter.owned_by(GROUP)), n, context.ship_log.read_text()[-1500:]))
+
+
+@then("within a minute the cluster holds the group's {n:d} rows and nothing of the other namespace")
+def step_within(context, n):
+    adapter = _within(context, n)
+    assert len(adapter.owned_by(GROUP)) == n and adapter.owned_by(USER) == []
+
+
+@when("the domain's Postgres takes {n:d} more of the group's rows")
+def step_more_rows(context, n):
+    _domain_rows(context, n, start=100)
+
+
+@then("within a minute the cluster holds the group's {n:d} rows")
+def step_within_n(context, n):
+    assert len(_within(context, n).owned_by(GROUP)) == n
+
+
+@then("stopping the service takes its tunnel down with it")
+def step_stop(context):
+    import os
+    import signal
+    import subprocess
+    import time
+    os.kill(context.service.pid, signal.SIGTERM)                 # as launchd stops it: the shell, not its group
+    context.service.wait(15)
+    time.sleep(1)
+    left = subprocess.run(["pgrep", "-f", "-s", str(context.service.pid), "ssh"], capture_output=True, text=True).stdout
+    assert not left.strip(), "left running: " + left
