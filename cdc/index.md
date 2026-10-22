@@ -201,6 +201,15 @@ is in the snapshot's rows (visible, so the stream skips it) or comes after them 
 with a writer inserting every 20 ms and a server whose every send takes 100 ms: the snapshot ends within the minute
 and every note reaches the server, none twice as the same op; the old drain fails the same scenario.
 
+**A server that never answers (2026-10-22).** Found live: the box's snapshot sat for over 16 minutes in one SSL read
+on memory.*, its request taken and never answered, because the relay's and the tokenizer's `urlopen` had no timeout.
+UC_LaptopCloudBridge's `relay.post` now gives every POST a timeout (`IQ_RELAY_TIMEOUT`, default 60 s) and raises
+`TimeoutError` naming the call (`POST /events/have (N keys)`, `POST /events (N records)`, `POST /identity/tokenize`);
+the cycle and the snapshot report it and are tried again, the have/missing check carrying on where they stopped, and
+`serve`'s prepare line now carries the step's error. `bridge.feature` holds it against a socket that accepts and never
+replies; without the timeout that scenario hangs, as the box did. Why memory.* sometimes takes a request and never
+answers it is the server's to find.
+
 **Leaving tables out (2026-10-22).** `iq-cdc.sh exclude 'game_test_*' cpcp_operations` (`cdc.exclude`) sets the
 publication to every table in public but those whose name matches a glob, each kept table with its row filter and
 column list, any other schema it carries kept too; the globs are saved (`~/.iq/cdc/exclude.json`) and `exclude` with

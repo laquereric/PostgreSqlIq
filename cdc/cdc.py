@@ -937,7 +937,8 @@ def prepare(d: str, state: str, streamer: "Streamer") -> dict:
         health = lag(d, state)["health"]
     if health in ("snapshot needed", "snapshot incomplete"):
         r = snapshot(d, streamer, state)
-        steps.append({"snapshot": {k: r.get(k) for k in ("ok", "sent", "already", "server", "stage")}})
+        steps.append({"snapshot": {k: r.get(k) for k in ("ok", "sent", "already", "server", "stage", "error")
+                                   if k != "error" or r.get(k)}})
         if not r["ok"]:
             return {"ok": False, "reason": "server_down" if r.get("server") == "down" else "snapshot", "steps": steps}
     return {"ok": True, "steps": steps, "health": lag(d, state)["health"]}
