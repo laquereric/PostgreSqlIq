@@ -172,5 +172,17 @@ Citus cluster the table is `iq.cluster_datum`, distributed by `owner` (remote `s
 `features/domains.feature`, 2026-10-22: each domain's rows on the one worker holding its shard, a domain's read a
 single-shard query, restore by owner, a foreign row refused).
 
+**Continuously (2026-10-22).** `apply.py ship <cluster-dsn> --domain-dsn <dsn> --namespace <ns> [--interval 5]
+[--once]` (`ship_domain`, `run_ship`) ships straight from the domain's slot to the cluster: no relay and no
+de-identification, because the cluster's record is the domain's exactly. Each cycle peeks whole transactions,
+decodes them, puts them through `apply_domain`, and only then advances the slot. That is at least once: a crash
+between the put and the advance ships them again, and a put of the same value is a no-op. A cluster it cannot reach
+(`cluster_unreachable`) or a refused row leaves the slot where it was. The domain's publication carries only its
+namespace (`namespace_filter`, a row filter on `plane_datum`), so the domain's accounts and identity map are never
+decoded and never leave the box. Covered by UC_Group's `domain.feature` (a throwaway pgembed domain: a cycle against
+an unreachable cluster leaves the slot whole, the next ships it and empties it, a later write ships alone) and remote
+`domains.feature` against the Vultr cluster (5 rows, then 2 more, nothing of another namespace). Running it as a
+service for a live domain is not set up yet.
+
 **Next.** Run `apply.py` where it reaches both the blobs and the global cluster. Narrow its read of
 `auth/events/` to the days past the watermark, because today it lists the whole prefix.

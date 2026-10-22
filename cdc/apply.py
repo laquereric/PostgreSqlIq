@@ -27,6 +27,7 @@ how a row is matched, how json is held -- stays in its adapter (dataplane.Postgr
                                                           [--domain <iq: IRI>]
     python apply.py plane <target-dsn> --host <box> [--hop proxy] [--prefix iq:token-status:] [--blobs <dir>]
     python apply.py domain <cluster-dsn> --host <domain> --namespace <u-|g-...> [--blobs <dir>]
+    python apply.py ship <cluster-dsn> --domain-dsn <dsn> --namespace <u-|g-...> [--interval 5] [--once]
 
 `plane` is the proxy's end of the domain's second hop (cdc.py --hop proxy): the domain's token-status records, put
 on the proxy's routing store as the values they are (put_records) -- never a replica, which could truncate it.
@@ -36,6 +37,11 @@ own cluster, so its slot is the default `iq_cdc`): every plane row the domain sh
 (dataplane.ClusterAdapter, one row per (owner, IRI), the owner its distribution column) through a plane bound to the
 domain's namespace -- so a domain that ships another namespace's row has it refused (not_my_namespace), and
 restoring a domain is selecting its owner (ClusterAdapter.owned_by). Puts, as `plane`: idempotent, no watermark.
+
+`ship` does it continuously, straight from the domain's slot to the cluster (no relay, no de-identification: the
+cluster's record is the domain's, exactly): each cycle peeks whole transactions, puts them through apply_domain,
+and advances the slot only once the cluster has them. The slot carries the domain's namespace only
+(namespace_filter, a publication row filter), so its accounts and identity map never leave the box.
 
 A device syncing to its domain is the same hop: with --domain, the device's heartbeat (cdc.status_record) and what
 the replay made of its records become the device's status in the domain (devices.observe).
@@ -206,6 +212,65 @@ def apply_domain(target: str, records, *, host: str, namespace: str, table: str 
     return put_records(cluster_plane(target, namespace, table, admit), records, host=host, prefix="iq:")
 
 
+_NS = __import__("re").compile(r"(?:u|g)-[0-9a-f]{24}")
+
+
+def namespace_filter(namespace: str) -> str:
+    """The publication row filter that keeps a domain's slot to its own namespace (cdc.set_filter on its
+    plane_datum): the owner part of iq:<kind>:<owner>/<local>. A row of any other namespace -- the domain's
+    accounts, its identity map -- is never decoded, so it never leaves the box."""
+    if not _NS.fullmatch(namespace or ""):
+        raise ValueError("not a domain's namespace: %r" % (namespace,))
+    return "split_part(split_part(iri, ':', 3), '/', 1) = '%s'" % namespace
+
+
+def ship_domain(domain_dsn: str, cluster_dsn: str, namespace: str, *, limit: int = 1000,
+                table: str = "cluster_datum", admit=None) -> dict:
+    """One cycle of a domain's continuous shipping: the slot's next whole transactions (up to `limit` changes),
+    peeked, decoded, put on the cluster (apply_domain), and only then the slot advanced past them. At least once:
+    a crash between the put and the advance ships them again, and a put of the same value is a no-op. A cluster
+    that cannot be reached, or that refuses a row, leaves the slot where it was, to be tried again.
+    -> {ok, shipped, put, already, advanced, pending_bytes} or {ok: False, reason, ...}"""
+    import psycopg
+    with psycopg.connect(domain_dsn, autocommit=True) as c:
+        sysid = cdc.system_id(c)
+        dec, records, done = cdc.Decoder(), [], None
+        for lsn, _x, data in cdc.peek(c, limit):
+            got = dec.feed(lsn, data)
+            if isinstance(got, list):
+                records += [cdc.record(ch, sysid, namespace) for ch in got]
+                done = got[0]["commit_lsn"]
+            elif isinstance(got, tuple):                  # a transaction with nothing published in it
+                done = got[1]
+        if done is None:
+            return {"ok": True, "shipped": 0, "put": 0, "already": 0, "advanced": None,
+                    "pending_bytes": cdc.pending_bytes(c)}
+        try:
+            r = apply_domain(cluster_dsn, records, host=namespace, namespace=namespace, table=table, admit=admit)
+        except psycopg.OperationalError as exc:
+            return {"ok": False, "reason": "cluster_unreachable", "detail": str(exc).splitlines()[0][:200],
+                    "shipped": 0, "advanced": None, "pending_bytes": cdc.pending_bytes(c)}
+        if not r["ok"]:
+            return {**r, "reason": "refused", "shipped": 0, "advanced": None, "pending_bytes": cdc.pending_bytes(c)}
+        cdc.advance(c, done)
+        return {**r, "shipped": len(records), "advanced": done, "pending_bytes": cdc.pending_bytes(c)}
+
+
+def run_ship(domain_dsn: str, cluster_dsn: str, namespace: str, *, interval: float = 5.0, cycles: int = 0,
+             limit: int = 1000, table: str = "cluster_datum", log=print) -> dict:
+    """Ship continuously: a cycle every `interval` seconds (at once again while a cycle fills its `limit`), for
+    `cycles` cycles (0: until stopped). Each cycle's answer is logged; the last is returned."""
+    import time
+    n, last = 0, {}
+    while not cycles or n < cycles:
+        last = ship_domain(domain_dsn, cluster_dsn, namespace, limit=limit, table=table)
+        n += 1
+        log(json.dumps(last))
+        if not (last.get("ok") and last.get("shipped", 0) >= limit):
+            time.sleep(interval if (not cycles or n < cycles) else 0)
+    return last
+
+
 def _plane(target: str, env: dict | None = None):
     """The global side's data plane, bound to the target store (dataplane.from_env names the store, not us)."""
     sys.path.insert(0, str(_store_dir()))
@@ -251,7 +316,7 @@ def _store_dir():
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="apply.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("what", choices=["lake", "plane", "domain"])
+    ap.add_argument("what", choices=["lake", "plane", "domain", "ship"])
     ap.add_argument("target_dsn", help="the global store, as the data plane's record role binds it")
     ap.add_argument("target_schema", nargs="?", help="lake: the schema the catalog is replayed into")
     ap.add_argument("--host", required=True, help="the box whose records to replay (the record's `host`)")
@@ -261,12 +326,20 @@ def main(argv=None) -> int:
                                      " device's status is recorded (GherkinIq/Facet/Store/devices.py)")
     ap.add_argument("--hop", default="proxy", help="plane: the hop whose records to put (cdc.py --hop)")
     ap.add_argument("--prefix", default="iq:token-status:", help="plane: only IRIs under this prefix are put")
-    ap.add_argument("--namespace", help="domain: the domain's namespace (u-<k> or g-<h>); its rows only")
+    ap.add_argument("--namespace", help="domain, ship: the domain's namespace (u-<k> or g-<h>); its rows only")
+    ap.add_argument("--domain-dsn", help="ship: the domain's Postgres, whose slot is shipped")
+    ap.add_argument("--interval", type=float, default=5.0, help="ship: seconds between cycles")
+    ap.add_argument("--once", action="store_true", help="ship: one cycle")
     a = ap.parse_args(argv)
     if a.what == "lake" and not a.target_schema:
         ap.error("lake needs a target schema")
-    if a.what == "domain" and not a.namespace:
-        ap.error("domain needs --namespace")
+    if a.what in ("domain", "ship") and not a.namespace:
+        ap.error("%s needs --namespace" % a.what)
+    if a.what == "ship":
+        if not a.domain_dsn:
+            ap.error("ship needs --domain-dsn")
+        r = run_ship(a.domain_dsn, a.target_dsn, a.namespace, interval=a.interval, cycles=1 if a.once else 0)
+        return 0 if r.get("ok") else 1
     store = DirStore(a.blobs) if a.blobs else _s3()
     if a.what == "domain":
         r = apply_domain(a.target_dsn, records_in(store), host=a.host, namespace=a.namespace)

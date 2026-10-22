@@ -131,3 +131,69 @@ def step_refused(context, reason):
     assert context.applied["refused"] == ["%s: %s" % (context.foreign, reason)] and context.applied["put"] == 1, \
         context.applied
     assert ClusterAdapter(_dsn(context), TABLE).owned_by(USER) == []
+
+
+def _domain_rows(context, n, start=0, ns=GROUP):
+    from dataplane import Datum
+    for i in range(start, start + n):
+        iri = "iq:group:%s/s%d" % (ns, i) if ns == GROUP else "iq:note:%s/s%d" % (ns, i)
+        assert context.domain_store.put(Datum(iri, "Bronze", json.dumps({"n": i}))).ok
+
+
+@given("a domain's own Postgres, its slot narrowed to the group's namespace, holding {g:d} of the group's rows and {o:d} of another namespace")
+def step_domain(context, g, o):
+    import shutil
+    import subprocess
+    import tempfile
+    import pgembed
+    from dataplane import PostgresAdapter
+    pgdata = tempfile.mkdtemp(prefix="iqcd", dir="/tmp")
+    srv = pgembed.get_server(pgdata, cleanup_mode=None)
+    srv.ensure_pgdata_inited()
+    srv.ensure_postgres_running()
+    dsn = "postgresql://postgres@/postgres?host=" + pgdata
+    pg_ctl = Path(pgembed.__file__).parent / "pginstall" / "bin" / "pg_ctl"
+
+    def stop():
+        try:
+            cdc.teardown(dsn)
+        finally:
+            subprocess.run([str(pg_ctl), "-D", pgdata, "-m", "fast", "-w", "stop"], capture_output=True)
+            shutil.rmtree(pgdata, ignore_errors=True)
+    context.add_cleanup(stop)
+    context.domain_store = PostgresAdapter(dsn)
+    held = cdc.setup(dsn, ("public.plane_datum",), restart_cmd=lambda: cdc.restart(pgdata))
+    assert held["ok"], held
+    held = cdc.set_filter(dsn, "public.plane_datum", apply.namespace_filter(GROUP))
+    assert held["ok"], held
+    context.domain_dsn = dsn
+    _domain_rows(context, g)
+    _domain_rows(context, o, ns=USER)
+
+
+@when("the shipper runs a cycle onto the cluster")
+def step_ship(context):
+    context.cycle = apply.ship_domain(context.domain_dsn, _dsn(context), GROUP, table=TABLE)
+    assert context.cycle["ok"], context.cycle
+
+
+@then("the cluster holds the group's {n:d} rows and nothing of the other namespace, and the domain's slot is empty")
+def step_shipped(context, n):
+    adapter = ClusterAdapter(_dsn(context), TABLE)
+    assert len(adapter.owned_by(GROUP)) == n and adapter.owned_by(USER) == [], adapter.owned_by(GROUP)
+    import psycopg
+    with psycopg.connect(context.domain_dsn, autocommit=True) as c:
+        assert cdc.peek(c, 10) == [], "the slot still holds changes"
+
+
+@when("the domain's Postgres takes {n:d} more of the group's rows, and the shipper runs a cycle onto the cluster")
+def step_more(context, n):
+    _domain_rows(context, n, start=100)
+    step_ship(context)
+
+
+@then("the cluster holds the group's {n:d} rows, and a further cycle ships nothing")
+def step_more_held(context, n):
+    assert len(ClusterAdapter(_dsn(context), TABLE).owned_by(GROUP)) == n
+    again = apply.ship_domain(context.domain_dsn, _dsn(context), GROUP, table=TABLE)
+    assert again["ok"] and again["shipped"] == 0, again

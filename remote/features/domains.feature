@@ -18,3 +18,11 @@ Feature: The cluster's record, distributed by owner -- a domain's rows on one wo
     Given the cluster's record is distributed by owner
     When a group's domain ships a row of a user's namespace among its own, and the cluster applies it
     Then that row is refused as "not_my_namespace", and the cluster holds nothing of that user
+
+  Scenario: a domain's own Postgres ships its slot onto the cluster continuously, its namespace only
+    Given the cluster's record is distributed by owner
+    And a domain's own Postgres, its slot narrowed to the group's namespace, holding 5 of the group's rows and 1 of another namespace
+    When the shipper runs a cycle onto the cluster
+    Then the cluster holds the group's 5 rows and nothing of the other namespace, and the domain's slot is empty
+    When the domain's Postgres takes 2 more of the group's rows, and the shipper runs a cycle onto the cluster
+    Then the cluster holds the group's 7 rows, and a further cycle ships nothing
