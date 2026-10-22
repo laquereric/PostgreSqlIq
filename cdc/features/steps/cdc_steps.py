@@ -846,3 +846,58 @@ def _every_note_once(context):
     assert sorted({i for _, i in recs}) == ids, (len({i for _, i in recs}), len(ids))
     dupes = sorted({x for x in recs if recs.count(x) > 1})
     assert not dupes, dupes[:10]                # an insert, or a snapshot row, of one note never twice
+
+
+
+# -- leaving tables out of the publication by name ---------------------------------------------------------
+@given("the box also holds a scratch table game_test_give_1 and the gate's cpcp_ops")
+def _scratch_tables(context):
+    for t in ("game_test_give_1", "cpcp_ops"):
+        _sql(context, "DROP TABLE IF EXISTS %s" % t)
+        _sql(context, "CREATE TABLE %s (id serial PRIMARY KEY, v text)" % t)
+    for t in ("notes2", "game_test_give_2"):
+        _sql(context, "DROP TABLE IF EXISTS %s" % t)
+
+    def drop():                                 # the scratch cluster is shared: a schema-wide snapshot would see them
+        for t in ("game_test_give_1", "cpcp_ops", "notes2", "game_test_give_2"):
+            _sql(context, "DROP TABLE IF EXISTS %s" % t)
+    context.add_cleanup(drop)
+    context.exclude_saved = os.path.join(context.pgdata, "cdc-state", "exclude.json")
+    if os.path.exists(context.exclude_saved):
+        os.remove(context.exclude_saved)
+
+
+@when('the publication leaves out "{a}" and "{b}"')
+def _exclude(context, a, b):
+    context.excluded = cdc.exclude(context.dsn, [a, b], saved=context.exclude_saved)
+    assert context.excluded["ok"], context.excluded
+
+
+@then("the publication carries notes, still only where id > 10, and neither of the others")
+def _excluded(context):
+    pub = cdc.status(context.dsn)["publication"]
+    assert "public.notes" in pub["tables"] and pub["filters"]["public.notes"] == "(id > 10)", pub
+    assert not {"public.game_test_give_1", "public.cpcp_ops"} & set(pub["tables"]), pub["tables"]
+    assert sorted(context.excluded["excluded"]) == ["public.cpcp_ops", "public.game_test_give_1"], context.excluded
+
+
+@when("note {n:d} is inserted, and game_test_give_1 and cpcp_ops each take a row")
+def _insert_all(context, n):
+    _insert(context, n)
+    _sql(context, "INSERT INTO game_test_give_1 (v) VALUES ('test')")
+    _sql(context, "INSERT INTO cpcp_ops (v) VALUES ('op')")
+
+
+@when("the box makes a table notes2 and a scratch table game_test_give_2, and the exclusion is applied again")
+def _again(context):
+    for t in ("notes2", "game_test_give_2"):
+        _sql(context, "CREATE TABLE %s (id serial PRIMARY KEY, v text)" % t)
+    context.excluded = cdc.exclude(context.dsn, [], saved=context.exclude_saved)
+    assert context.excluded["ok"], context.excluded
+
+
+@then("the publication takes in notes2 and still leaves out every game_test table")
+def _again_held(context):
+    tables = cdc.status(context.dsn)["publication"]["tables"]
+    assert "public.notes2" in tables and context.excluded["added"] == ["public.notes2"], context.excluded
+    assert not [t for t in tables if t.startswith("public.game_test_")], tables

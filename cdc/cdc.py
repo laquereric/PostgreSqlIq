@@ -686,6 +686,52 @@ def narrow(d: str, table: str, *, where=KEEP, columns=KEEP, full: bool = False) 
             "tables": pub["tables"], "schemas": pub["schemas"]}
 
 
+def exclude_path() -> str:
+    return os.path.join(os.path.expanduser(os.environ.get("IQ_CDC_HOME", "~/.iq/cdc")),
+                        "exclude%s.json" % ("-" + HOP if HOP else ""))
+
+
+def exclude(d: str, patterns, *, saved: str = "") -> dict:
+    """Capture every table in public but those whose name matches one of `patterns` (globs, e.g. game_test_*): the
+    publication becomes the list of the others, each keeping its row filter and column list, and keeps any other
+    schema it carries (publish_schema). A table made later is not captured until exclude runs again (with no
+    patterns, the saved ones: `saved`, written here). Changes already in the slot decode as they were published
+    when written, so a backlog of excluded tables is dropped with rebuild (--force), and the snapshot that follows
+    ships the kept tables' rows. -> {ok, tables, excluded, added, removed}"""
+    import fnmatch
+    patterns = [p for p in (patterns or []) if p]
+    if not patterns and saved and os.path.exists(saved):
+        patterns = json.load(open(saved)).get("patterns", [])
+    if not patterns:
+        return {"ok": False, "reason": "no_patterns", "detail": "name the tables to leave out, e.g. 'game_test_*'"}
+    import psycopg
+    with psycopg.connect(d) as c:
+        if not c.execute("select 1 from pg_publication where pubname=%s", (PUBLICATION,)).fetchone():
+            return {"ok": False, "reason": "no_publication", "detail": "run: iq-cdc.sh setup"}
+        spec = _spec(c)
+        schemas = [n for (n,) in c.execute(
+            "select n.nspname from pg_publication_namespace pn join pg_namespace n on n.oid = pn.pnnspid "
+            "join pg_publication p on p.oid = pn.pnpubid where p.pubname = %s", (PUBLICATION,)) if n != "public"]
+        public = [t for (t,) in c.execute("select 'public.' || tablename from pg_tables where schemaname = 'public' "
+                                          "order by 1")]
+        out_ = [t for t in public if any(fnmatch.fnmatchcase(t.split(".", 1)[1], p) for p in patterns)]
+        keep = [t for t in public if t not in out_]
+        keep += [t for t in spec if not t.startswith("public.") and t.split(".", 1)[0] not in schemas]
+        if not keep and not schemas:
+            return {"ok": False, "reason": "nothing_left", "detail": "every table matches %s" % patterns}
+        parts = [_ident(t) + (" (%s)" % ", ".join('"%s"' % x.replace('"', '""') for x in spec[t]["columns"])
+                              if t in spec and spec[t]["columns"] else "")
+                 + (" WHERE (%s)" % spec[t]["where"] if t in spec and spec[t]["where"] else "") for t in keep]
+        target = ", ".join((["TABLE " + ", ".join(parts)] if parts else []) + ["TABLES IN SCHEMA " + _ident(n) for n in schemas])
+        c.execute("ALTER PUBLICATION %s SET %s" % (PUBLICATION, target))
+    if saved:
+        os.makedirs(os.path.dirname(saved), exist_ok=True)
+        write_state(saved, {"patterns": patterns})
+    before = set(spec)
+    return {"ok": True, "tables": keep, "excluded": out_, "schemas": schemas,
+            "added": sorted(set(keep) - before), "removed": sorted(before - set(keep))}
+
+
 def set_filter(d: str, table: str, where: str = None, *, full: bool = False) -> dict:
     """Capture only the rows of `table` matching `where`; None clears the filter (its column list is kept)."""
     return narrow(d, table, where=where, full=full)
@@ -961,6 +1007,8 @@ def main(argv=None) -> int:
     pb = sub.add_parser("publish", help="add a whole schema, REPLICA IDENTITY FULL (the lake's catalog: ducklake)")
     pb.add_argument("schema")
     sub.add_parser("snapshot", help="ship the rows that existed before the slot (drains the slot first)")
+    ex = sub.add_parser("exclude", help="capture every table in public but those matching these globs")
+    ex.add_argument("patterns", nargs="*", help="e.g. 'game_test_*' cpcp_operations (none: the saved ones)")
     f = sub.add_parser("filter", help="capture only matching rows of a table (publication row filter)")
     f.add_argument("table", nargs="?", help="schema.table (none: list the filters)")
     f.add_argument("where", nargs="?", help="a row filter expression, e.g. \"realm = 'root'\"")
@@ -976,7 +1024,7 @@ def main(argv=None) -> int:
         r.add_argument("--interval", type=float, default=10.0)
     a = p.parse_args(argv)
     use_hop(a.hop)
-    widen = a.cmd in ("columns", "publish") or (a.cmd == "filter" and (a.table or a.reset or a.clear))
+    widen = a.cmd in ("columns", "publish", "exclude") or (a.cmd == "filter" and (a.table or a.reset or a.clear))
     if a.hop and widen:
         print("[iq-cdc] the %s hop captures what HOPS fixes; it is not narrowed or widened here" % a.hop)
         return 2
@@ -1027,6 +1075,10 @@ def main(argv=None) -> int:
             print("[iq-cdc] rebuilt: run iq-cdc.sh %ssnapshot while the IQ Server is up" % ("--hop %s " % HOP if HOP else ""))
             return 0
         a.cmd = "snapshot"
+    if a.cmd == "exclude":
+        res = exclude(d, a.patterns, saved=exclude_path())
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
     if a.cmd == "publish":
         res = publish_schema(d, a.schema)
         print(json.dumps(res, indent=2))

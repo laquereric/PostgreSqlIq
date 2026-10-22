@@ -15,6 +15,10 @@
 #   iq-cdc.sh columns [schema.table a,b,c | schema.table --clear]
 #                                                    capture only these columns (publication column list); must
 #                                                    include the replica identity, refused otherwise
+#   iq-cdc.sh exclude ['glob' ...]                  capture every table in public but those matching (e.g.
+#                                                    'game_test_*' cpcp_operations); none: re-apply the saved ones
+#                                                    (new tables are captured only then); a backlog of the excluded
+#                                                    goes with: rebuild --force, then snapshot
 #   iq-cdc.sh status                                 slot position, WAL held, server up/down
 #   iq-cdc.sh once                                   one cycle (exit 0 = shipped or nothing to ship, server up)
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out

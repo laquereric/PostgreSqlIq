@@ -201,6 +201,16 @@ is in the snapshot's rows (visible, so the stream skips it) or comes after them 
 with a writer inserting every 20 ms and a server whose every send takes 100 ms: the snapshot ends within the minute
 and every note reaches the server, none twice as the same op; the old drain fails the same scenario.
 
+**Leaving tables out (2026-10-22).** `iq-cdc.sh exclude 'game_test_*' cpcp_operations` (`cdc.exclude`) sets the
+publication to every table in public but those whose name matches a glob, each kept table with its row filter and
+column list, any other schema it carries kept too; the globs are saved (`~/.iq/cdc/exclude.json`) and `exclude` with
+none re-applies them, taking in tables made since (a table made later is not captured until then). Changes already in
+the slot decode as they were published when written, so a backlog of the left-out tables goes with `rebuild --force`
+and the snapshot after it ships the kept tables' rows. Found live: other sessions' scratch tables (`game_test_*`) and
+the gate's replay churn (`cpcp_operations`) filled the box's slot faster than it drained. `cdc.feature`: a filter
+kept through the narrowing, a left-out table's change not shipped, a new real table taken in again and a new scratch
+table not; three mutants caught.
+
 **The streamer as a LaunchAgent (2026-10-22).** `iq-cdc.sh serve` is `run` after readying the slot
 (`cdc.prepare`): a lost slot rebuilt, a needed or incomplete snapshot run, a down IQ Server waited out (`server_down`,
 tried again every interval); no slot is never made (`no_slot`: setup is by hand). `service/iq-cdc-launchd.sh` runs

@@ -237,6 +237,19 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     When the streamer runs until the slot is empty
     Then every note in the table reached the server, none twice as the same op
 
+  Scenario: Tables left out of the publication by name never stream, and a new real table is taken in again
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    And the publication carries notes only where id > 10
+    And the box also holds a scratch table game_test_give_1 and the gate's cpcp_ops
+    When the publication leaves out "game_test_*" and "cpcp_ops"
+    Then the publication carries notes, still only where id > 10, and neither of the others
+    When note 48 is inserted, and game_test_give_1 and cpcp_ops each take a row
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+    When the box makes a table notes2 and a scratch table game_test_give_2, and the exclusion is applied again
+    Then the publication takes in notes2 and still leaves out every game_test table
+
   Scenario: The service readies a lost slot before it streams: rebuilt, snapshotted, then streaming
     Given CDC is set up on a fresh notes table
     And the IQ Server is up
