@@ -873,6 +873,28 @@ def snapshot(d: str, streamer: "Streamer", state: str, *, between=None, fetch: i
     return {**out, **snap}
 
 
+def prepare(d: str, state: str, streamer: "Streamer") -> dict:
+    """What a service does before it streams (iq-cdc.sh serve): a lost slot rebuilt (rebuild), then a snapshot
+    that is needed or was left incomplete run (snapshot, which needs the server up). No slot is not made here:
+    what a box captures is set up by hand (setup). -> {ok, steps, health} or {ok: False, reason, steps}"""
+    steps = []
+    health = lag(d, state)["health"]
+    if health == "no slot":
+        return {"ok": False, "reason": "no_slot", "steps": steps}
+    if health == "lost":
+        r = rebuild(d, state)
+        steps.append({"rebuild": {k: r[k] for k in ("ok", "was", "reason") if k in r}})
+        if not r["ok"]:
+            return {"ok": False, "reason": "rebuild", "steps": steps}
+        health = lag(d, state)["health"]
+    if health in ("snapshot needed", "snapshot incomplete"):
+        r = snapshot(d, streamer, state)
+        steps.append({"snapshot": {k: r.get(k) for k in ("ok", "sent", "already", "server", "stage")}})
+        if not r["ok"]:
+            return {"ok": False, "reason": "server_down" if r.get("server") == "down" else "snapshot", "steps": steps}
+    return {"ok": True, "steps": steps, "health": lag(d, state)["health"]}
+
+
 # -- CLI --------------------------------------------------------------------------------------------------
 def credentials() -> list:
     """The paired credentials to try, read afresh each time: $IQ_HARNESS_SESSION, then ~/.iq/harness-token. A
@@ -947,7 +969,7 @@ def main(argv=None) -> int:
     k.add_argument("table", nargs="?", help="schema.table (none: list the column lists)")
     k.add_argument("names", nargs="?", help="comma-separated columns; must include the replica identity")
     k.add_argument("--clear", action="store_true", help="capture every column of the table again")
-    for name in ("once", "run"):
+    for name in ("once", "run", "serve"):
         r = sub.add_parser(name)
         r.add_argument("--interval", type=float, default=10.0)
     a = p.parse_args(argv)
@@ -1024,7 +1046,7 @@ def main(argv=None) -> int:
     if not st["slot"]:
         print("[iq-cdc] no slot %s -- run: iq-cdc.sh %ssetup" % (SLOT, "--hop %s " % HOP if HOP else ""))
         return 2
-    if st["slot"]["wal_status"] == "lost":
+    if st["slot"]["wal_status"] == "lost" and a.cmd != "serve":
         print("[iq-cdc] slot %s lost its WAL (cap %s exceeded) -- run: iq-cdc.sh %srebuild --snapshot"
               % (SLOT, st["wal_cap"], "--hop %s " % HOP if HOP else ""))
         return 2
@@ -1038,6 +1060,16 @@ def main(argv=None) -> int:
             res = snapshot(d, st, state_path())
             print(json.dumps(res, indent=2))
             return 0 if res["ok"] else 1
+        if a.cmd == "serve":                    # the service: ready the slot (waiting out a down server), then run
+            while True:
+                res = prepare(d, state_path(), st)
+                print("[iq-cdc] %s prepare %s" % (datetime.now().strftime("%H:%M:%S"), json.dumps(res)), flush=True)
+                if res["ok"]:
+                    break
+                if res["reason"] not in ("server_down", "snapshot"):
+                    return 2
+                time.sleep(a.interval)
+            a.cmd = "run"
         while True:
             res = st.cycle()
             if a.cmd == "once" or res["sent"] or res["already"] or res.get("error") or res.get("paused") \

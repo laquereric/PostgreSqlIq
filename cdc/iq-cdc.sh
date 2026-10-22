@@ -3,7 +3,8 @@
 # @facet Store
 #
 # CDC from the box's Postgres (pgembed, ~/.iq/pg) to the IQ Server (memory.*), only while the IQ Server is up.
-# NEVER autostarted: no launchd job, no app hook -- you run it, it streams in the foreground until Ctrl-C.
+# Never started by the app: you run it, it streams in the foreground until Ctrl-C -- or you install it as your own
+# LaunchAgent (service/install-cdc.sh: com.iq.cdc runs `serve`), opted into by hand, removed with --remove.
 #   iq-cdc.sh setup [schema.table ...] [--restart]  wal_level=logical (+1GB WAL cap), publication + slot iq_cdc;
 #                                                    --restart lets it restart Postgres when wal_level must change
 #   iq-cdc.sh snapshot                               ship the rows that existed before the slot (drains it first);
@@ -17,6 +18,8 @@
 #   iq-cdc.sh status                                 slot position, WAL held, server up/down
 #   iq-cdc.sh once                                   one cycle (exit 0 = shipped or nothing to ship, server up)
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out
+#   iq-cdc.sh serve [--interval 10]                  as run, after readying the slot: a lost one rebuilt, a needed
+#                                                    or incomplete snapshot run (a down server waited out)
 #   iq-cdc.sh teardown                               drop the slot and publication (stop holding WAL)
 #   iq-cdc.sh rebuild [--snapshot] [--force]         a lost slot (WAL past the cap) made again, the publication
 #                                                    kept; --snapshot then ships what it never did (server up)

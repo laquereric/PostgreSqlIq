@@ -229,6 +229,35 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     Then rebuilding the slot is refused as "not_lost"
     And rebuilding it by force makes a new slot and asks for a snapshot
 
+  Scenario: The service readies a lost slot before it streams: rebuilt, snapshotted, then streaming
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    When note 45 is inserted
+    And the slot loses its WAL past a 1MB cap while nothing streams
+    And the service readies the slot
+    Then it rebuilt the slot and ran the snapshot, and the lag is ok
+    And the server holds 1 records of op cdc:snapshot
+    When note 46 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+
+  Scenario: The service waits out a down server, its snapshot still needed, and readies the slot once it is up
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is down
+    When note 47 is inserted
+    And the slot loses its WAL past a 1MB cap while nothing streams
+    And the service readies the slot
+    Then readying it is refused as "server_down", the slot rebuilt and the lag saying snapshot needed
+    When the IQ Server comes up
+    And the service readies the slot
+    Then it ran the snapshot, and the lag is ok
+
+  Scenario: The service does not make a slot nobody set up
+    Given CDC is set up on a fresh notes table
+    When CDC is torn down
+    And the service readies the slot
+    Then readying it is refused as "no_slot"
+
   Scenario: The Dashboard's Agents tab shows the same lag
     Given CDC is set up on a fresh notes table
     And the IQ Server is up

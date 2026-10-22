@@ -752,3 +752,35 @@ def _rebuild_forced(context):
     assert r["ok"] and r["was"] == "reserved" and r["slot"]["wal_status"] == "reserved", r
     assert cdc.read_state(context.state)["status"] == "needed"
     assert _lag(context)["health"] == "snapshot needed"
+
+
+
+# -- the service: readying the slot before it streams ------------------------------------------------------
+@when("the service readies the slot")
+def _ready(context):
+    context.ready = cdc.prepare(context.dsn, context.state, _streamer(context))
+
+
+@then("it rebuilt the slot and ran the snapshot, and the lag is ok")
+def _readied(context):
+    r = context.ready
+    assert r["ok"] and r["health"] == "ok", r
+    assert [list(x) for x in r["steps"]] == [["rebuild"], ["snapshot"]] and r["steps"][0]["rebuild"]["was"] == "lost", r
+
+
+@then("it ran the snapshot, and the lag is ok")
+def _readied_snapshot(context):
+    r = context.ready
+    assert r["ok"] and r["health"] == "ok" and [list(x) for x in r["steps"]] == [["snapshot"]], r
+
+
+@then('readying it is refused as "{reason}", the slot rebuilt and the lag saying snapshot needed')
+def _ready_down(context, reason):
+    r = context.ready
+    assert not r["ok"] and r["reason"] == reason and r["steps"][0]["rebuild"]["ok"], r
+    assert _lag(context)["health"] == "snapshot needed"
+
+
+@then('readying it is refused as "{reason}"')
+def _ready_refused(context, reason):
+    assert not context.ready["ok"] and context.ready["reason"] == reason, context.ready

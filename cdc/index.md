@@ -193,6 +193,15 @@ never did (`--snapshot` runs it at once, with the server up). A healthy slot is 
 kept, streams the next insert, and snapshots the rest; three mutants caught. A rebuilt slot that nothing reads is
 lost again in time: it holds only while a streamer runs (or a snapshot follows soon enough).
 
+**The streamer as a LaunchAgent (2026-10-22).** `iq-cdc.sh serve` is `run` after readying the slot
+(`cdc.prepare`): a lost slot rebuilt, a needed or incomplete snapshot run, a down IQ Server waited out (`server_down`,
+tried again every interval); no slot is never made (`no_slot`: setup is by hand). `service/iq-cdc-launchd.sh` runs
+it (the box's Postgres down ends the run; `--print` shows the configuration), and `service/install-cdc.sh` installs
+it as your own `com.iq.cdc` (KeepAlive, ThrottleInterval 120, log `~/.iq/cdc/cdc.log`; `--remove`). It stays opted
+into by hand: the IQ app never installs it. `cdc.feature`: a lost slot readied (rebuilt, snapshotted, then
+streaming), a down server waited out with the snapshot still needed, no slot refused; three mutants caught. Not
+installed on the box.
+
 **As a service (2026-10-22).** The `cluster` hop (`cdc.HOPS`) is the shipper's own slot, `iq_cdc_cluster`, so it
 never takes the default hop's changes; its row filter is the domain's namespace, set by `apply.py ship-setup`.
 `ship --resync` first puts every row of the namespace again (what went by while a slot was away), and a lost slot
