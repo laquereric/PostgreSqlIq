@@ -702,3 +702,53 @@ def _both(context, where, a, b, table):
 def _filter_only(context, where, table):
     pub = cdc.status(context.dsn)["publication"]
     assert pub["filters"] == {table: where} and pub["columns"] == {}, pub
+
+
+# -- a lost slot, rebuilt -----------------------------------------------------------------------------------
+@given("the publication carries notes only where id > 10")
+def _only_over_10(context):
+    assert cdc.set_filter(context.dsn, "public.notes", "id > 10")["ok"]
+
+
+@when("the slot loses its WAL past a 1MB cap while nothing streams")
+def _lose(context):
+    _sql(context, "ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+    _sql(context, "select pg_reload_conf()")
+    try:
+        for _ in range(20):
+            _unpublished(context, 20000)
+            _sql(context, "select pg_switch_wal()")
+            _sql(context, "CHECKPOINT")
+            if cdc.status(context.dsn)["slot"]["wal_status"] == "lost":
+                break
+    finally:
+        _sql(context, "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'")
+        _sql(context, "select pg_reload_conf()")
+    assert cdc.status(context.dsn)["slot"]["wal_status"] == "lost", cdc.status(context.dsn)["slot"]
+
+
+@when("the slot is rebuilt")
+def _rebuild(context):
+    context.rebuilt = cdc.rebuild(context.dsn, context.state)
+    assert context.rebuilt["ok"], context.rebuilt
+
+
+@then("the rebuild found it lost, and the publication still carries notes only where id > 10")
+def _rebuilt_kept(context):
+    assert context.rebuilt["was"] == "lost", context.rebuilt
+    assert context.rebuilt["slot"]["wal_status"] == "reserved", context.rebuilt["slot"]
+    assert context.rebuilt["publication"]["filters"] == {"public.notes": "(id > 10)"}, context.rebuilt["publication"]
+
+
+@then('rebuilding the slot is refused as "{reason}"')
+def _rebuild_refused(context, reason):
+    r = cdc.rebuild(context.dsn, context.state)
+    assert not r["ok"] and r["reason"] == reason, r
+
+
+@then("rebuilding it by force makes a new slot and asks for a snapshot")
+def _rebuild_forced(context):
+    r = cdc.rebuild(context.dsn, context.state, force=True)
+    assert r["ok"] and r["was"] == "reserved" and r["slot"]["wal_status"] == "reserved", r
+    assert cdc.read_state(context.state)["status"] == "needed"
+    assert _lag(context)["health"] == "snapshot needed"

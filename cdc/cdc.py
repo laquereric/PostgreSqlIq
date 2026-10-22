@@ -328,6 +328,31 @@ def teardown(d: str, state: str = "") -> dict:
     return {"ok": True, "dropped_slot": slot}
 
 
+def rebuild(d: str, state: str = "", *, force: bool = False) -> dict:
+    """A lost slot made again: its WAL went past the cap (max_slot_wal_keep_size) while nothing streamed, so it can
+    never be read again. Only the slot is dropped and created; the publication -- its tables, filters, column lists,
+    the schemas it carries -- stays as it is. What the lost slot never shipped comes back with a snapshot, so the
+    snapshot state is marked `needed` (the lag says so; the streamer streams meanwhile, and the snapshot's have/
+    missing check ships each row once). A healthy slot is refused (not_lost) unless `force`; a slot in use, always
+    (in_use); with no publication there is nothing to rebuild (no_publication: setup)."""
+    st = status(d)
+    s = st["slot"]
+    if st["publication"] is None:
+        return {"ok": False, "reason": "no_publication", "detail": "run: iq-cdc.sh setup"}
+    if s and s["active"]:
+        return {"ok": False, "reason": "in_use", "detail": "a streamer holds %s: stop it first" % SLOT}
+    if s and s["wal_status"] != "lost" and not force:
+        return {"ok": False, "reason": "not_lost", "wal_status": s["wal_status"]}
+    with _connect(d) as c:
+        if s:
+            c.execute("select pg_drop_replication_slot(%s)", (SLOT,))
+        c.execute("select pg_create_logical_replication_slot(%s, 'pgoutput')", (SLOT,))
+    if state:
+        write_state(state, {"status": "needed", "since": datetime.now(timezone.utc).isoformat(),
+                            "why": "slot %s rebuilt (it was %s)" % (SLOT, s["wal_status"] if s else "missing")})
+    return {"ok": True, "was": s["wal_status"] if s else None, **status(d)}
+
+
 FULL_TRIGGER = "iq_cdc_full_identity"
 
 
@@ -701,7 +726,8 @@ def lag(d: str, state: str = "") -> dict:
     """How far the IQ Server is behind the box, read without touching the slot (a running streamer holds it):
     the WAL written since the slot's position (`behind_bytes`: unshipped, since an idle cycle moves the slot to the
     WAL's end), the WAL the slot holds against its cap, the snapshot, and the last cycle (when, server up or down).
-    `health`: no slot | lost | at risk (unreserved, or over half the cap) | snapshot incomplete | behind (WAL
+    `health`: no slot | lost | at risk (unreserved, or over half the cap) | snapshot incomplete | snapshot needed
+    (a rebuilt slot: run iq-cdc.sh snapshot) | behind (WAL
     unshipped and no cycle in 5 minutes) | ok."""
     st = status(d)
     snap = read_state(state) if state else {}
@@ -726,6 +752,8 @@ def lag(d: str, state: str = "") -> dict:
         out["health"] = "at risk"
     elif snap.get("status") == "running":
         out["health"] = "snapshot incomplete"
+    elif snap.get("status") == "needed":
+        out["health"] = "snapshot needed"
     elif s["behind_bytes"] > 0 and (age is None or age > 300):
         out["health"] = "behind"
     else:
@@ -903,6 +931,9 @@ def main(argv=None) -> int:
     s.add_argument("--restart", action="store_true", help="restart Postgres if wal_level must change")
     sub.add_parser("status")
     sub.add_parser("teardown")
+    rb = sub.add_parser("rebuild", help="make a lost slot again (the publication kept); then a snapshot is needed")
+    rb.add_argument("--force", action="store_true", help="rebuild a slot that is not lost")
+    rb.add_argument("--snapshot", action="store_true", help="then run the snapshot (the IQ Server must be up)")
     pb = sub.add_parser("publish", help="add a whole schema, REPLICA IDENTITY FULL (the lake's catalog: ducklake)")
     pb.add_argument("schema")
     sub.add_parser("snapshot", help="ship the rows that existed before the slot (drains the slot first)")
@@ -963,6 +994,15 @@ def main(argv=None) -> int:
     if a.cmd == "teardown":
         print(json.dumps(teardown(d, state_path())))
         return 0
+    if a.cmd == "rebuild":
+        res = rebuild(d, state_path(), force=a.force)
+        print(json.dumps(res, indent=2))
+        if not res["ok"]:
+            return 1
+        if not a.snapshot:
+            print("[iq-cdc] rebuilt: run iq-cdc.sh %ssnapshot while the IQ Server is up" % ("--hop %s " % HOP if HOP else ""))
+            return 0
+        a.cmd = "snapshot"
     if a.cmd == "publish":
         res = publish_schema(d, a.schema)
         print(json.dumps(res, indent=2))
@@ -985,7 +1025,8 @@ def main(argv=None) -> int:
         print("[iq-cdc] no slot %s -- run: iq-cdc.sh %ssetup" % (SLOT, "--hop %s " % HOP if HOP else ""))
         return 2
     if st["slot"]["wal_status"] == "lost":
-        print("[iq-cdc] slot %s lost its WAL (cap %s exceeded) -- teardown and setup again" % (SLOT, st["wal_cap"]))
+        print("[iq-cdc] slot %s lost its WAL (cap %s exceeded) -- run: iq-cdc.sh %srebuild --snapshot"
+              % (SLOT, st["wal_cap"], "--hop %s " % HOP if HOP else ""))
         return 2
     with _connect(d) as c:
         tokenizer = identity_map.RemoteTokenizer(base, bearer=creds[0])

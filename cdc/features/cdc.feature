@@ -207,6 +207,28 @@ Feature: The box's Postgres streamed to the IQ Server, only while it is up
     When CDC is torn down
     Then the lag says no slot
 
+  Scenario: A lost slot is rebuilt: the publication kept, a new slot, and the snapshot asked for again
+    Given CDC is set up on a fresh notes table
+    And the IQ Server is up
+    And the publication carries notes only where id > 10
+    When note 43 is inserted
+    And the slot loses its WAL past a 1MB cap while nothing streams
+    Then the lag says lost
+    When the slot is rebuilt
+    Then the rebuild found it lost, and the publication still carries notes only where id > 10
+    And the lag says snapshot needed
+    When note 44 is inserted
+    And the streamer runs one cycle
+    Then the server holds 1 records of op cdc:insert
+    When the snapshot runs
+    Then the lag is ok and behind by less than 1 kB
+    And the server holds 2 records of op cdc:snapshot
+
+  Scenario: A slot that is not lost is not rebuilt unless asked
+    Given CDC is set up on a fresh notes table
+    Then rebuilding the slot is refused as "not_lost"
+    And rebuilding it by force makes a new slot and asks for a snapshot
+
   Scenario: The Dashboard's Agents tab shows the same lag
     Given CDC is set up on a fresh notes table
     And the IQ Server is up

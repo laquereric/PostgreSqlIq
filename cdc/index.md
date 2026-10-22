@@ -183,6 +183,16 @@ decoded and never leave the box. Covered by UC_Group's `domain.feature` (a throw
 an unreachable cluster leaves the slot whole, the next ships it and empties it, a later write ships alone) and remote
 `domains.feature` against the Vultr cluster (5 rows, then 2 more, nothing of another namespace). 
 
+**A lost slot, rebuilt (2026-10-22).** A slot nothing reads holds WAL until `max_slot_wal_keep_size` (1GB), and
+then Postgres invalidates it (`wal_status` lost): it can never be read again. `iq-cdc.sh rebuild` (`cdc.rebuild`)
+drops and creates only the slot -- the publication, with its tables, filters and column lists, stays as it is -- and
+marks the snapshot `needed`, so the lag says `snapshot needed` until `iq-cdc.sh snapshot` ships what the lost slot
+never did (`--snapshot` runs it at once, with the server up). A healthy slot is refused (`not_lost`) unless
+`--force`; a slot a streamer holds, always (`in_use`). The streamer's refusal of a lost slot now names the command.
+`cdc.feature` loses a slot for real (a 1MB cap, unpublished writes, checkpoints), rebuilds it with its row filter
+kept, streams the next insert, and snapshots the rest; three mutants caught. A rebuilt slot that nothing reads is
+lost again in time: it holds only while a streamer runs (or a snapshot follows soon enough).
+
 **As a service (2026-10-22).** The `cluster` hop (`cdc.HOPS`) is the shipper's own slot, `iq_cdc_cluster`, so it
 never takes the default hop's changes; its row filter is the domain's namespace, set by `apply.py ship-setup`.
 `ship --resync` first puts every row of the namespace again (what went by while a slot was away), and a lost slot

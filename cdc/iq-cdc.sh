@@ -18,6 +18,8 @@
 #   iq-cdc.sh once                                   one cycle (exit 0 = shipped or nothing to ship, server up)
 #   iq-cdc.sh run [--interval 10]                    stream until stopped; a down server is waited out
 #   iq-cdc.sh teardown                               drop the slot and publication (stop holding WAL)
+#   iq-cdc.sh rebuild [--snapshot] [--force]         a lost slot (WAL past the cap) made again, the publication
+#                                                    kept; --snapshot then ships what it never did (server up)
 #   iq-cdc.sh publish ducklake                       add the lake's catalog schema, REPLICA IDENTITY FULL
 #   iq-cdc.sh --hop proxy setup|snapshot|once|run|status|teardown
 #                                                    the domain's second hop: token status to the proxy, its own
