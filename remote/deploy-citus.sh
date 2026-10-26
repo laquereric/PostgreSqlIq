@@ -21,6 +21,7 @@
 #   ./deploy-citus.sh lake-vultr  # the cold tier moved onto Vultr Object Storage (the subscription holding iq-blobs),
 #                                 # in its own bucket iq-lake; the key goes from the API to the coordinator only
 #   ./deploy-citus.sh search-up   # ParadeDB's pg_search (BM25) on every node (service/install-search.sh)
+#   ./deploy-citus.sh trgm-up     # pg_trgm (contrib, on every node already) and the GiST trigram index (trgm.sql)
 #   ./deploy-citus.sh gate-up     # the gate writer's login role iq_gate (slice 5; up and hosts-up run it too)
 #   ./deploy-citus.sh backup-up   # pgBackRest on every node into Vultr bucket iq-citus-backup: WAL + a full backup
 #   ./deploy-citus.sh status      # every iq-citus instance
@@ -423,6 +424,13 @@ search_up() { # pg_search on every node's host, then the extension (created on t
   ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -v ON_ERROR_STOP=1 -d iq -c 'CREATE EXTENSION IF NOT EXISTS pg_search' -c \"SELECT 'pg_search ' || extversion FROM pg_extension WHERE extname = 'pg_search'\" -At"
 }
 
+trgm_up() { # pg_trgm ships in postgresql17-contrib on every node: create it and the index on the coordinator
+  local h
+  h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
+  ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -v ON_ERROR_STOP=1 -d iq" < "$here/trgm.sql"
+  ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -At -d iq -c \"SELECT 'pg_trgm ' || extversion FROM pg_extension WHERE extname = 'pg_trgm'\" -c \"SELECT 'shards with datum_trgm ' || sum(result::int) FROM run_command_on_workers('SELECT count(*) FROM pg_class WHERE relname LIKE ''datum_trgm%''')\""
+}
+
 lake_up() {
   local h tar
   h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
@@ -470,11 +478,12 @@ case "${1:-}" in
   hosts-up|hosts-down|hosts-park|hosts-restore|lake-build|lake-build-down|autopark) tunnel; f="${1//-/_}"; "$f" ;;
   lake-up) lake_up ;;
   search-up) search_up ;;
+  trgm-up) trgm_up ;;
   gate-up) gate_up ;;
   backup-up) tunnel; backup_up ;;
   object-storage) tunnel; object_storage ;;
   lake-vultr) tunnel; lake_vultr ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | hosts-park | hosts-restore | autopark | lake-build | lake-build-down | lake-up | lake-vultr | search-up | gate-up | backup-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 up | down | hosts-up | hosts-down | hosts-park | hosts-restore | autopark | lake-build | lake-build-down | lake-up | lake-vultr | search-up | trgm-up | gate-up | backup-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
 esac

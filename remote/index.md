@@ -190,6 +190,12 @@ conversation.
      across mention counts (one mention up to 0.85, two from 0.80) and the top ten shares 7 of 10 with one table's.
    - Breaks caught: the walk stopped at one hop (3 fail), seed classes not expanded, the walk let through the
      vocabulary (the size is no longer flat); a search's write committed early.
+   - **Trigram search on the distributed record** (`deploy-citus.sh trgm-up`, `trgm.sql`, 2026-10-25): pg_trgm 1.6
+     from postgresql17-contrib, and `datum_trgm`, a GiST `gist_trgm_ops` index on `iq.datum.raw`, on every shard.
+     A misspelling ("lakehose") finds every datum that says "lakehouse", from every worker. The nearest come first,
+     and each of the 8 shards' plans walks its own index (`features/trgm.feature`, [`TRGM-hosts.md`](TRGM-hosts.md)).
+     pg_trgm's float4 default thresholds make GiST miss rows exactly at the threshold, so `trgm.sql` sets all three
+     as doubles on every node's database (UC_PgliteIq slice 3 measured the bug).
    - Not yet: the ProtegeIq vocabulary and a WebScrape corpus as real loads; global BM25 statistics.
 5. **Operations.** **Built 2026-10-17.**
    - **The gate is the only writer** ([`GATE-hosts.md`](GATE-hosts.md), `gated_plane.py`, `gate/iam.json`): an

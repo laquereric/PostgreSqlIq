@@ -20,6 +20,6 @@ and the modules it shares (GherkinIq/Facet/Store, UC_LaptopCloudBridge).
 
 | Folder | Was (in IQ) | What |
 |---|---|---|
-| `local/` | `UC_App/iq-pg.sh`, `UC_Postgres/age/`, `docs/architecture/PGEMBED_SETUP.okf` | LOCAL: the box's pgembed, AGE compiled into it; `UC_App/iq-pg.sh` stays as a shim |
+| `local/` | `UC_App/iq-pg.sh`, `UC_Postgres/age/`, `docs/architecture/PGEMBED_SETUP.okf` | LOCAL: the box's pgembed, AGE and pg_trgm (`local/pg_trgm`, from PostgreSQL 17.9's contrib) compiled into it; `UC_App/iq-pg.sh` stays as a shim |
 | `remote/` | `UC_Citus` | REMOTE: the Citus cluster on Vultr -- ACID, SHACL at commit, search, tiered Iceberg, gate, backup, autopark |
 | `cdc/` | `UC_CDC` | CDC: the box's Postgres streamed to the IQ Server through the slot `iq_cdc` |
