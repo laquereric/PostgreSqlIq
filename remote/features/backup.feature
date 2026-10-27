@@ -1,6 +1,6 @@
 # @use_case Development/UseCase/UC_Citus
 # @facet Store
-@backup
+@backup @host
 Feature: Every node backed up to Vultr, and restorable to one moment across the cluster
   pgBackRest on every node archives its WAL continuously and keeps full backups in a Vultr bucket of its own.
   Citus writes one named restore point into every node's WAL at once, so all nodes can be brought back to the same

@@ -24,8 +24,10 @@ CREATE TABLE IF NOT EXISTS iq.event (
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.event'::regclass) THEN
-        PERFORM create_distributed_table('iq.event', 'iri', colocate_with => 'iq.datum');
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN   -- a Citus cluster; a single server keeps the table local
+        IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.event'::regclass) THEN
+            PERFORM create_distributed_table('iq.event', 'iri', colocate_with => 'iq.datum');
+        END IF;
     END IF;
 END $$;
 

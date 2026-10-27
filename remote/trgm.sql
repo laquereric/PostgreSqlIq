@@ -16,6 +16,11 @@ CREATE INDEX IF NOT EXISTS datum_trgm ON iq.datum USING gist (raw gist_trgm_ops)
 ALTER DATABASE iq SET pg_trgm.similarity_threshold = 0.3;
 ALTER DATABASE iq SET pg_trgm.word_similarity_threshold = 0.6;
 ALTER DATABASE iq SET pg_trgm.strict_word_similarity_threshold = 0.5;
-SELECT run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.similarity_threshold = 0.3$cmd$);
-SELECT run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.word_similarity_threshold = 0.6$cmd$);
-SELECT run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.strict_word_similarity_threshold = 0.5$cmd$);
+DO $$
+BEGIN
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN   -- a Citus cluster's workers; a server has none
+        PERFORM run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.similarity_threshold = 0.3$cmd$);
+        PERFORM run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.word_similarity_threshold = 0.6$cmd$);
+        PERFORM run_command_on_workers($cmd$ALTER DATABASE iq SET pg_trgm.strict_word_similarity_threshold = 0.5$cmd$);
+    END IF;
+END $$;

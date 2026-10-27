@@ -38,7 +38,13 @@ def stores(c):
 
 @given("the Citus cluster on Vultr")
 def step_cluster(context):
+    """The store as deploy-citus.sh put it up: a cluster with two workers, or -- the server shape -- one server with
+    no Citus at all (the Citus-only scenarios are skipped there, environment.py)."""
     with context.cluster.connect(autocommit=True) as c:
+        if context.cluster.mode == "server":
+            n = c.execute("SELECT count(*) FROM pg_extension WHERE extname = 'citus'").fetchone()[0]
+            assert n == 0, "a server shape with Citus loaded"
+            return
         n = c.execute("SELECT count(*) FROM citus_get_active_worker_nodes()").fetchone()[0]
     assert n >= 2, "%d workers" % n
 

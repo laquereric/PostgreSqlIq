@@ -1,5 +1,6 @@
 # @use_case Development/UseCase/UC_Citus
 # @facet Store
+@citus
 Feature: The cluster's record, distributed by owner -- a domain's rows on one worker, its read a single-shard query
   UC_Group's rule 3 on Citus. iq.cluster_datum (schema.sql) holds one row per (owner, iri) and is distributed by
   owner; PostgreSqlIq cdc apply.py domain puts a domain's shipped rows there through dataplane.ClusterAdapter, on a

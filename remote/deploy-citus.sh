@@ -2,9 +2,17 @@
 # @use_case Development/UseCase/UC_Citus
 # @facet Store
 #
-# UC_Citus: an on-demand Citus cluster on Vultr, private: only :22 is open; Postgres is reached through an SSH tunnel.
+# UC_Citus: IQ's remote store on Vultr, private: only :22 is open; Postgres is reached through an SSH tunnel.
 #
-#   ./deploy-citus.sh up          # slice 1: one instance, the whole cluster on it (coordinator + 3 workers by port)
+# The store has a SHAPE, a switch: `server` (the default) is ONE plain PostgreSQL 17 -- the same schema, the tables
+# local; `citus` is a Citus cluster -- the same schema, the record distributed. Citus is the later migration step: a
+# server holding the record becomes a cluster by MIGRATE-to-Citus.md, never by flipping the switch.
+#
+#   ./deploy-citus.sh shape [server|citus]   # the shape `up` builds (~/.iq/citus/shape; SHAPE overrides); setting
+#                                 # it is refused while the other shape is up
+#   ./deploy-citus.sh up          # the shape: server -- one instance (iq-pg), PostgreSQL 17 + pgvector, Citus
+#                                 # installed but not loaded; citus -- slice 1: one instance (iq-citus), the whole
+#                                 # cluster on it (coordinator + 3 workers by port)
 #   ./deploy-citus.sh down        # destroy it (on demand: the schema is re-applied by the scenarios)
 #   ./deploy-citus.sh hosts-up    # slice 2: a VPC and four instances -- coordinator, w1, w2 and a spare w3 --
 #                                 # one node each, the nodes talking over the VPC's private addresses only
@@ -38,10 +46,12 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 REGION="${REGION:-ewr}"
 PLAN="${PLAN:-vc2-2c-4gb}"
-LABEL="${LABEL:-iq-citus}"
 SSH_KEY_ID="${SSH_KEY_ID-4d07a7fe-a68a-4f92-8f7b-e7968f71b6be}"
 API=https://api.vultr.com/v2
 STATE="$HOME/.iq/citus"; mkdir -p "$STATE"
+SHAPE="${SHAPE:-$(cat "$STATE/shape" 2>/dev/null || echo server)}"
+case "$SHAPE" in server|citus) ;; *) echo "SHAPE is server or citus, not $SHAPE" >&2; exit 2 ;; esac
+LABEL="${LABEL:-$([ "$SHAPE" = server ] && echo iq-pg || echo iq-citus)}"
 SSHO=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 VULTR_VIA="${VULTR_VIA-root@45.77.77.5}"
 SOCKS_PORT="${VULTR_SOCKS_PORT:-11081}"
@@ -97,6 +107,35 @@ single_topology() {
   jq -n --arg h "$1" '{mode:"single", coordinator:{host:$h, port:5432, unit:"coord"},
     workers:{"localhost:5433":{name:"w1",host:$h,port:5433,unit:"w1"}, "localhost:5434":{name:"w2",host:$h,port:5434,unit:"w2"},
              "localhost:5435":{name:"w3",host:$h,port:5435,unit:"w3"}}, spare:"localhost:5435"}' > "$STATE/topology.json"
+}
+
+server_topology() { # the server shape: the one node is the coordinator, and there are no workers
+  jq -n --arg h "$1" '{mode:"server", coordinator:{host:$h, port:5432, unit:"coord"}, workers:{}, spare:null}' \
+    > "$STATE/topology.json"
+}
+
+# the switch: which shape `up` builds. A shape that is up holds the record, so the switch never moves away from it:
+# server -> citus is MIGRATE-to-Citus.md; a cluster -> server is a dump and restore, by hand.
+shape() {
+  local want="${1:-}" up
+  up=$(jq -r .mode "$STATE/topology.json" 2>/dev/null || true)
+  if [ -z "$want" ]; then
+    echo "shape: $SHAPE$([ -f "$STATE/shape" ] || echo ' (the default)')"
+    [ -n "$up" ] && echo "up: $up ($(jq -r .coordinator.host "$STATE/topology.json"))" || echo "up: nothing"
+    [ -f "$STATE/topology-parked.json" ] && echo "parked: a Citus cluster ($STATE/topology-parked.json; hosts-restore)"
+    return 0
+  fi
+  case "$want" in server|citus) ;; *) echo "shape is server or citus" >&2; exit 2 ;; esac
+  if [ "$want" = citus ] && [ "$up" = server ]; then
+    echo "refused: a server is up and holds the record -- moving it to Citus is the migration (MIGRATE-to-Citus.md), not the switch" >&2; exit 1
+  fi
+  if [ "$want" = server ] && { [ "$up" = single ] || [ "$up" = hosts ]; }; then
+    echo "refused: a Citus cluster is up ($up) and holds the record -- take it down or park it first" >&2; exit 1
+  fi
+  echo "$want" > "$STATE/shape"
+  say "shape: $want"
+  [ "$want" = server ] && [ -f "$STATE/topology-parked.json" ] && say "the parked Citus cluster stays parked; a new server starts empty"
+  return 0
 }
 
 # --- slice 2: one node per instance, over a VPC ------------------------------------------------------------------
@@ -428,6 +467,10 @@ trgm_up() { # pg_trgm ships in postgresql17-contrib on every node: create it and
   local h
   h=$(jq -r .coordinator.host "$STATE/topology.json" 2>/dev/null) || { echo "no cluster (up or hosts-up)" >&2; exit 1; }
   ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -q -v ON_ERROR_STOP=1 -d iq" < "$here/trgm.sql"
+  if [ "$(jq -r .mode "$STATE/topology.json")" = server ]; then
+    ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -At -d iq -c \"SELECT 'pg_trgm ' || extversion FROM pg_extension WHERE extname = 'pg_trgm'\""
+    return 0
+  fi
   ssh "${SSHO[@]}" "root@$h" "sudo -u postgres /usr/pgsql-17/bin/psql -X -At -d iq -c \"SELECT 'pg_trgm ' || extversion FROM pg_extension WHERE extname = 'pg_trgm'\" -c \"SELECT 'shards with datum_trgm ' || sum(result::int) FROM run_command_on_workers('SELECT count(*) FROM pg_class WHERE relname LIKE ''datum_trgm%''')\""
 }
 
@@ -445,12 +488,13 @@ lake_up() {
 }
 
 up() {
-  local i ip
+  local i ip role=single
+  [ "$SHAPE" = server ] && role=server
   i=$(instance)
   if [ -n "$i" ]; then read -r _ ip _ <<<"$i"; echo "$ip" > "$STATE/host"; else launch; ip=$(cat "$STATE/host"); fi
-  say "installing on $ip"
-  ssh "${SSHO[@]}" "root@$ip" bash -s < "$here/service/install-citus.sh"
-  single_topology "$ip"
+  say "installing $SHAPE on $ip"
+  ssh "${SSHO[@]}" "root@$ip" "ROLE=$role bash -s" < "$here/service/install-citus.sh"
+  if [ "$SHAPE" = server ]; then server_topology "$ip"; else single_topology "$ip"; fi
   gate_up
   say "running: $LABEL $ip"
 }
@@ -461,7 +505,7 @@ down() {
   read -r id ip _ <<<"$i"
   api DELETE "/instances/$id" >/dev/null
   ssh-keygen -R "$ip" >/dev/null 2>&1 || true
-  [ "$(jq -r .mode "$STATE/topology.json" 2>/dev/null)" = single ] && rm -f "$STATE/topology.json" "$STATE/host"
+  case "$(jq -r .mode "$STATE/topology.json" 2>/dev/null)" in single|server) rm -f "$STATE/topology.json" "$STATE/host" ;; esac
   say "destroyed $LABEL ($id, $ip)"
 }
 
@@ -470,10 +514,12 @@ status() {
   rows=$(api GET '/instances?per_page=100' | jq -r --arg l "$LABEL" '.instances[] | select(.label==$l or (.label|startswith($l+"-"))) | "\(.label) \(.main_ip) \(.power_status) \(.id)"')
   [ -n "$rows" ] && echo "$rows" || echo "absent"
   [ -f "$STATE/topology.json" ] && echo "topology: $(jq -r .mode "$STATE/topology.json")"
+  echo "shape: $SHAPE"
   return 0
 }
 
 case "${1:-}" in
+  shape) shape "${2:-}" ;;
   up|down|status) tunnel; "$1" ;;
   hosts-up|hosts-down|hosts-park|hosts-restore|lake-build|lake-build-down|autopark) tunnel; f="${1//-/_}"; "$f" ;;
   lake-up) lake_up ;;
@@ -485,5 +531,5 @@ case "${1:-}" in
   lake-vultr) tunnel; lake_vultr ;;
   psql) h=$(cat "$STATE/host" 2>/dev/null) || { echo "no host (run up)" >&2; exit 1; }
         shift; ssh "${SSHO[@]}" "root@$h" sudo -u postgres /usr/pgsql-17/bin/psql -X -p 5432 -d iq ${1:+-c "$(printf %q "$*")"} ;;
-  *) echo "usage: $0 up | down | hosts-up | hosts-down | hosts-park | hosts-restore | autopark | lake-build | lake-build-down | lake-up | lake-vultr | search-up | trgm-up | gate-up | backup-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
+  *) echo "usage: $0 shape [server|citus] | up | down | hosts-up | hosts-down | hosts-park | hosts-restore | autopark | lake-build | lake-build-down | lake-up | lake-vultr | search-up | trgm-up | gate-up | backup-up | object-storage | status | psql [sql]" >&2; exit 2 ;;
 esac

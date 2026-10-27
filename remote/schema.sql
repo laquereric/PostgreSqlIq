@@ -42,15 +42,26 @@ CREATE TABLE IF NOT EXISTS iq.vocab (
     PRIMARY KEY (s, p, o)
 );
 
+-- The store's shape (deploy-citus.sh shape): on a single server (`server`, no Citus) the tables stay local and only
+-- the foreign key is added; on a Citus cluster (`citus`) they are distributed first. A server made a cluster later
+-- (MIGRATE-to-Citus.md) runs this again: the server's rows are distributed, and its foreign key is kept as it is.
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.datum'::regclass) THEN
-        SET LOCAL citus.shard_count = 8;
-        PERFORM create_distributed_table('iq.datum', 'iri');
-        PERFORM create_distributed_table('iq.quad', 'g', colocate_with => 'iq.datum');
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.datum'::regclass) THEN
+            IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'quad_of_datum') THEN
+                ALTER TABLE iq.quad DROP CONSTRAINT quad_of_datum;   -- Citus distributes a table without it
+            END IF;
+            SET LOCAL citus.shard_count = 8;
+            PERFORM create_distributed_table('iq.datum', 'iri');
+            PERFORM create_distributed_table('iq.quad', 'g', colocate_with => 'iq.datum');
+            ALTER TABLE iq.quad ADD CONSTRAINT quad_of_datum FOREIGN KEY (g) REFERENCES iq.datum (iri)
+                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
+            PERFORM create_reference_table('iq.vocab');
+        END IF;
+    ELSIF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'quad_of_datum') THEN
         ALTER TABLE iq.quad ADD CONSTRAINT quad_of_datum FOREIGN KEY (g) REFERENCES iq.datum (iri)
             ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
-        PERFORM create_reference_table('iq.vocab');
     END IF;
 END $$;
 
@@ -277,8 +288,10 @@ CREATE TABLE IF NOT EXISTS iq.cluster_datum (
 );
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.cluster_datum'::regclass) THEN
-        PERFORM create_distributed_table('iq.cluster_datum', 'owner');
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN   -- a Citus cluster; a single server keeps the table local
+        IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.cluster_datum'::regclass) THEN
+            PERFORM create_distributed_table('iq.cluster_datum', 'owner');
+        END IF;
     END IF;
 END $$;
 

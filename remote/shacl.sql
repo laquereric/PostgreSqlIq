@@ -39,10 +39,12 @@ CREATE UNLOGGED TABLE IF NOT EXISTS iq.shacl_pending (g text NOT NULL);
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.shape_target'::regclass) THEN
-        PERFORM create_reference_table('iq.shape_target');
-        PERFORM create_reference_table('iq.shape_property');
-        PERFORM create_reference_table('iq.shape_closed');
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN   -- a Citus cluster; a single server keeps the table local
+        IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.shape_target'::regclass) THEN
+            PERFORM create_reference_table('iq.shape_target');
+            PERFORM create_reference_table('iq.shape_property');
+            PERFORM create_reference_table('iq.shape_closed');
+        END IF;
     END IF;
 END $$;
 

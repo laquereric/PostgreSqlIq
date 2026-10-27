@@ -12,6 +12,25 @@ store); neither scales the governed record *and* keeps those guarantees. Can a P
 [Citus](https://github.com/citusdata/citus) (AGPL-3.0, all features open since 11.0; the AGPL is already accepted for
 pg_search) shards Postgres across nodes and keeps it ACID with two-phase commit.
 
+## The store's shape: one server now, Citus later
+
+The remote store has a **shape**, a switch: `deploy-citus.sh shape [server|citus]` (kept in `~/.iq/citus/shape`;
+`SHAPE` overrides it).
+
+- **`server`, the default,** is one plain PostgreSQL 17 on one Vultr instance (`iq-pg`): pgvector, pg_trgm, the
+  gate's writer, SHACL at commit and query-time inference, the same schema with its tables local.
+- **`citus`** is the cluster this page describes.
+
+`up` builds the selected shape, and `install-citus.sh ROLE=server` installs Citus without loading it. The schema
+files run their Citus branches only where the Citus catalog exists, so the one schema serves both shapes. A shape
+that is up holds the record, so the switch refuses to move away from it. A server becomes a cluster by
+[MIGRATE-to-Citus.md](MIGRATE-to-Citus.md), the later step, on the same box.
+
+A topology may also name a server by `dsn` (no tunnel, no ssh), for a throwaway Postgres in tests. The scenarios
+tagged `@citus` (placement, two-phase commit, crashes, scale-out, `domains`) are skipped on a server, and those
+tagged `@host` (backups) are skipped on a server reached by DSN. Each skip is named in the report. On PostgreSQL
+17.9 the server shape passes every other scenario (`*-server.md`).
+
 ## The design
 
 | MarkLogic gives | Citus does it by |

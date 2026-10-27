@@ -2,7 +2,10 @@
 
     topology()            what deploy-citus.sh put up (~/.iq/citus/topology.json, or IQ_CITUS_TOPOLOGY): the
                           coordinator's host, and each worker by the name Citus knows it as (`<nodename>:<port>`)
-                          with its host and systemd unit -- one host by ports (slice 1) or one host each (slice 2)
+                          with its host and systemd unit -- one host by ports (slice 1) or one host each (slice 2) --
+                          or, the `server` shape, the one node and no workers. A topology with a `dsn` names a
+                          server reached directly (a superuser's DSN, e.g. a throwaway Postgres on loopback): no
+                          tunnel and no ssh; the schema is applied through it and `iq` connects with it as its user
     Cluster.open()        an SSH tunnel to the coordinator, the role iq's password read over ssh into memory (never
                           written here), the schema applied as postgres over ssh
     cluster.connect()     a psycopg connection as iq (not autocommit: the caller owns the transaction)
@@ -88,9 +91,17 @@ class Cluster:
     def name(self, key: str) -> str:
         return "coordinator" if key == COORD else self.topo["workers"][key]["name"]
 
+    @property
+    def dsn(self) -> str:
+        return self.topo.get("dsn", "")
+
     @classmethod
     def open(cls) -> "Cluster":
         c = cls(topology())
+        if c.dsn:
+            c.admin((HERE / "schema.sql").read_text())
+            c.admin((HERE / "shacl.sql").read_text())
+            return c
         c.port = _free_port()
         c._sock = tempfile.mktemp(prefix="iq-citus-", dir="/tmp")
         subprocess.run(["ssh", *SSHO, "-f", "-N", "-M", "-S", c._sock, "-o", "ExitOnForwardFailure=yes",
@@ -109,6 +120,8 @@ class Cluster:
         """As iq (the owner the scenarios set up and check with), or as another login role -- iq_gate, the gate's
         writer -- whose password is read once from the coordinator into memory."""
         import psycopg
+        if self.dsn:
+            return psycopg.connect(self.dsn, user=role, autocommit=autocommit, connect_timeout=10)
         pw = self.password if role == "iq" else self._password(role)
         return psycopg.connect(host="127.0.0.1", port=self.port, dbname="iq", user=role, password=pw,
                                autocommit=autocommit, connect_timeout=10)
@@ -127,6 +140,12 @@ class Cluster:
 
     def admin(self, sql: str, node: str = COORD) -> str:
         """psql as postgres on a node, the statement on stdin (one value per line, unaligned)."""
+        if self.dsn:   # a server reached directly: its superuser's DSN, the script as one simple query
+            import psycopg
+            with psycopg.connect(self.dsn, autocommit=True, connect_timeout=10) as c:
+                cur = c.execute(sql)
+                rows = cur.fetchall() if cur.description else []
+            return "\n".join("|".join("" if v is None else str(v) for v in r) for r in rows)
         n = self.node(node)
         r = subprocess.run(["ssh", *SSHO, "root@" + n["host"],
                             "sudo -u postgres %s/psql -X -q -At -v ON_ERROR_STOP=1 -p %d -d iq" % (PG, n["port"])],
@@ -237,8 +256,8 @@ def load_platform(cluster: Cluster) -> Platform:
 
 
 def two_workers(cluster: Cluster) -> None:
-    """The cluster as a run starts it: the spare drained and out, if an earlier run left it in."""
-    if in_cluster(cluster, cluster.spare):
+    """The cluster as a run starts it: the spare drained and out, if an earlier run left it in (a server has none)."""
+    if cluster.mode != "server" and in_cluster(cluster, cluster.spare):
         remove_worker(cluster, cluster.spare)
 
 

@@ -51,6 +51,7 @@ Feature: SHACL shapes enforced at commit, as GraphDB enforces them
     Then the commit is refused by the shapes, naming "object" for "minCount"
     And "test:claim-ok" still has its object
 
+  @citus
   Scenario: Across workers, one datum that breaks its shape keeps the other out
     Given two Claims on different workers, the second with no subject_iri
     When one transaction commits both

@@ -11,6 +11,9 @@
 #       iq-citus@<node>, all on 127.0.0.1 only:
 #         coord :5432 the coordinator (reference tables, no shards); w1 :5433, w2 :5434 workers; w3 :5435 a spare,
 #         running but NOT in the cluster (the scale-out scenario adds it)
+#   ROLE=server (the default shape, deploy-citus.sh shape): ONE plain PostgreSQL 17 on :5432, loopback only -- the
+#       Citus package is installed but neither preloaded nor created, so making this server a Citus coordinator later
+#       is a migration on the same box (MIGRATE-to-Citus.md), not a reinstall
 #   ROLE=coordinator | worker (slice 2): one node, iq-citus@coord or iq-citus@node on :5432, listening on loopback
 #       and on PRIVATE_IP (the Vultr VPC); pg_hba and firewalld admit SUBNET only, to 5432 only. A worker expects
 #       /root/citus-{postgres,iq}.txt already copied from the coordinator (deploy-citus.sh does it over ssh).
@@ -24,12 +27,14 @@ CITUS_PKG="${CITUS_PKG:-citus142_17}"
 BIN=/usr/pgsql-$PGV/bin
 BASE=/var/lib/pgsql/$PGV
 ROLE="${ROLE:-single}"
+PRELOAD=citus; [ "$ROLE" = server ] && PRELOAD=''
 case "$ROLE" in
+  server) NODES="coord:5432"; LISTEN=127.0.0.1 ;;
   single) NODES="coord:5432 w1:5433 w2:5434 w3:5435"; LISTEN=127.0.0.1 ;;
   coordinator) NODES="coord:5432"; LISTEN="127.0.0.1,${PRIVATE_IP:?}"; : "${SUBNET:?}" ;;
   worker) NODES="node:5432"; LISTEN="127.0.0.1,${PRIVATE_IP:?}"; : "${SUBNET:?}"
           [ -s /root/citus-iq.txt ] && [ -s /root/citus-postgres.txt ] || { echo "no passwords from the coordinator" >&2; exit 1; } ;;
-  *) echo "ROLE is single, coordinator or worker" >&2; exit 2 ;;
+  *) echo "ROLE is server, single, coordinator or worker" >&2; exit 2 ;;
 esac
 say() { echo "$(date '+%F %T') $*"; }
 
@@ -90,7 +95,7 @@ for np in $NODES; do
 port = $p
 listen_addresses = '$LISTEN'
 unix_socket_directories = '/run/postgresql'
-shared_preload_libraries = 'citus'
+shared_preload_libraries = '$PRELOAD'
 wal_level = logical
 max_prepared_transactions = 100
 max_connections = 100
@@ -119,7 +124,8 @@ DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq') THEN C
 ALTER ROLE iq PASSWORD '$PW_IQ';
 SQL
   [ "$(psql_n "$p" -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = 'iq'")" = 1 ] || psql_n "$p" -d postgres -c "CREATE DATABASE iq OWNER iq"
-  psql_n "$p" -d iq -c "CREATE EXTENSION IF NOT EXISTS citus; CREATE EXTENSION IF NOT EXISTS vector;"
+  [ "$ROLE" = server ] || psql_n "$p" -d iq -c "CREATE EXTENSION IF NOT EXISTS citus;"
+  psql_n "$p" -d iq -c "CREATE EXTENSION IF NOT EXISTS vector;"
 done
 
 # the VPC: Postgres on the private address, from the subnet only
@@ -127,6 +133,7 @@ if [ -n "${SUBNET:-}" ]; then
   rule="rule family=ipv4 source address=$SUBNET port port=5432 protocol=tcp accept"
   firewall-cmd -q --query-rich-rule="$rule" || { firewall-cmd -q --permanent --add-rich-rule="$rule"; firewall-cmd -q --reload; }
 fi
+[ "$ROLE" = server ] && { say "server: PostgreSQL $(psql_n 5432 -d iq -Atc 'SHOW server_version'), pgvector $(psql_n 5432 -d iq -Atc "SELECT extversion FROM pg_extension WHERE extname='vector'"), Citus installed, not loaded"; exit 0; }
 [ "$ROLE" = worker ] && { say "worker on $PRIVATE_IP:5432: $(psql_n 5432 -d iq -Atc "SELECT 'citus ' || extversion FROM pg_extension WHERE extname='citus'")"; exit 0; }
 
 # 4. the cluster (single): coordinator + w1 + w2 (w3 waits for the scale-out scenario); a coordinator's workers are

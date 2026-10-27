@@ -11,11 +11,13 @@ Feature: Trigram search over the distributed record, nearest first on a GiST ind
     And the trigram index on the record
     And 60 datums of text on the plane, spread over the workers
 
+  @citus
   Scenario: A misspelled word finds every datum that says the word, from every worker
     When the record is searched for words like "lakehose"
     Then every datum whose text says "lakehouse" is found, and no other
     And the datums found are held on every worker
 
+  @citus
   Scenario: The nearest come first, walked on each shard's GiST index
     When the nearest 10 datums to "lakehose" are asked
     Then each of them says "lakehouse"

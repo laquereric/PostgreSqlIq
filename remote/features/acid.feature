@@ -11,6 +11,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     Given the Citus cluster on Vultr
     And the platform is put as datums, its vocabulary on every node
 
+  @citus
   Scenario: The record is spread over the workers, each datum whole on one, the vocabulary on every node
     Then the datums' shards are on 2 workers
     And every datum's triples are on the worker that holds its document
@@ -35,6 +36,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     When the transaction rolls back
     Then no session sees "test:duckdb" as a Store
 
+  @citus
   Scenario: Inference is never stale: new data and a new vocabulary are answered at once
     When "test:duckdb" is committed as a RecordStore
     Then "test:duckdb" is a Store at once, with nothing recomputed
@@ -42,6 +44,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     Then "test:motherduck" is a Store at once, with nothing recomputed
     And every node's copy of the vocabulary holds "test:ColumnStore"
 
+  @citus
   Scenario: One transaction across two workers commits on both or on neither
     Given two test datums whose shards are on different workers
     When one transaction puts both
@@ -50,7 +53,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     Then the commit is refused
     And neither of the second transaction's writes answers
 
-  @hold
+  @hold @citus
   Scenario: A two-phase commit whose worker crashes after PREPARE is finished by the coordinator
     Given two test datums whose shards are on different workers
     And the first worker holds its PREPARE for 4 seconds
@@ -61,7 +64,7 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     Then both answer
     And no prepared transaction is left on any worker
 
-  @hold
+  @hold @citus
   Scenario: A two-phase commit whose coordinator crashes after PREPARE commits nowhere
     Given two test datums whose shards are on different workers
     And the first worker holds its PREPARE for 4 seconds
@@ -77,11 +80,13 @@ Feature: Postgres at scale keeps MarkLogic's transaction guarantees
     Then the first is refused with a serialization failure
     And "test:tiered" is at tier "Gold"
 
+  @citus
   Scenario: A committed datum survives a crash of the worker that holds it
     When "test:durable" is committed as a RecordStore
     And the worker holding it is stopped as a crash stops it, and started again
     Then "test:durable" answers with its document and its triples
 
+  @citus
   Scenario: A worker is added and removed while writes go on
     (Run it twice: a worker removed with its moved shards' old copies not yet dropped broke the next add.)
     Given the third worker is not in the cluster
