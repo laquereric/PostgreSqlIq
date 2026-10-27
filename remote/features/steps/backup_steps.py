@@ -45,10 +45,11 @@ def step_info(context):
 
 
 def put_on(context, name, worker):
-    """A datum named <name>-<n> that lands on `worker`; returns its IRI."""
+    """A datum named <name>-<n> that lands on `worker` (on the server shape, the one server holds every IRI)."""
+    server = context.cluster.mode == "server"
     for n in range(500):
         iri = cp.NS + "%s-%d" % (name, n)
-        if context.cluster.node_of(iri) == worker:
+        if server or context.cluster.node_of(iri) == worker:
             with context.cluster.connect() as c:
                 cp.put(c, iri, [(iri, cp.RDF + "type", cp.NS + "RecordStore", False)])
                 c.commit()
@@ -58,6 +59,10 @@ def put_on(context, name, worker):
 
 @given('a datum "{name}" committed on the first worker')
 def step_before(context, name):
+    if context.cluster.mode == "server":            # the server is the one node there is
+        context.worker = cp.COORD
+        context.before = put_on(context, name, context.worker)
+        return
     context.worker = sorted(context.cluster.topo["workers"])[0]
     if context.worker == context.cluster.spare:
         context.worker = sorted(context.cluster.topo["workers"])[1]
@@ -67,7 +72,8 @@ def step_before(context, name):
 @when("a restore point is made across the cluster")
 def step_point(context):
     context.point = "iq-drill-%d" % int(time.time())
-    context.cluster.admin("SELECT citus_create_restore_point('%s')" % context.point)
+    fn = "pg_create_restore_point" if context.cluster.mode == "server" else "citus_create_restore_point"
+    context.cluster.admin("SELECT %s('%s')" % (fn, context.point))
     for node in nodes(context):                                   # the WAL holding the point, archived everywhere
         context.cluster.host_sh("sudo -u postgres pgbackrest --stanza=%s check" % stanza(context, node), node)
 
@@ -98,11 +104,17 @@ def step_restore(context):
 @then('the restored worker holds "{a}" and not "{b}"')
 def step_holds(context, a, b):
     def held(iri):
+        if context.cluster.mode == "server":        # the record is local: no shard to name
+            return context.cluster.host_sh(
+                "sudo -u postgres %s/psql -X -At -p 5499 -d iq -c \"SELECT count(*) FROM iq.datum WHERE iri = '%s'\""
+                % (PG, iri), context.worker).strip()
         shard = context.cluster.admin("SELECT get_shard_id_for_distribution_column('iq.datum', '%s'::text)" % iri)
         return context.cluster.host_sh(
             "sudo -u postgres %s/psql -X -At -p 5499 -d iq -c \"SELECT count(*) FROM iq.datum_%s WHERE iri = '%s'\""
             % (PG, shard, iri), context.worker).strip()
     assert held(context.before) == "1", "the restored worker lost what was committed before the point"
     assert held(context.after) == "0", "the restored worker has what was committed after the point"
+    if context.cluster.mode == "server":
+        return
     live = context.cluster.node_of(context.after)
     assert live == context.worker

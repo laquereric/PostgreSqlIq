@@ -243,8 +243,14 @@ conversation.
    - Found by the drill after the restore: `pg_ctl start` returns once a restored server serves reads, while it is
      still replaying towards the point -- and ParadeDB Community refuses reads from a server in recovery. The
      drill now waits for the promotion (`pg_is_in_recovery()` false) before it reads.
-   - Not yet: a key scoped to the backup and lake buckets (the subscription's key is on every node); backups on a
-     schedule (pg_cron or a timer); restoring the whole cluster to a point, not one worker; autopark installed
+   - **Scheduled (2026-10-27):** `install-backup.sh` installs systemd timers on every host, per stanza: a full
+     backup Sundays at 03:00 UTC and a differential the other days. With `retention-full=2`, two weeks are kept.
+   - **The server shape is backed up (2026-10-27):** `iq-pg-coord` in `iq-citus-backup` under `/iq-pg`. Its WAL is
+     archived continuously, there are two full backups (6.6 MB each) and a 4 KB differential, the latter run once
+     by its timer's unit to prove it. `BACKUP-server.md`: both scenarios pass. The drill restored the server
+     beside itself to a `pg_create_restore_point` in 38 s.
+   - Not yet: a key scoped to the backup and lake buckets (the subscription's key is on every node); restoring the
+     whole cluster to a point, not one worker; autopark installed
      (`service/install-autopark.sh` is written; loading the LaunchAgent is the user's call).
 
 ## Run
