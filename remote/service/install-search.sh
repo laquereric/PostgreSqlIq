@@ -14,11 +14,14 @@ if ! rpm -q pg_search_17 >/dev/null 2>&1; then
   echo "$SHA  /root/pg_search.rpm" | sha256sum -c --quiet
   dnf -y -q install /root/pg_search.rpm; rm -f /root/pg_search.rpm
 fi
-# preloaded on every node here, after citus (which must come first); each node restarted once for it
+# preloaded on every node here, after citus when there is Citus (it must come first) -- alone on the server shape,
+# whose list is empty; each node restarted once for it
 for conf in /var/lib/pgsql/17/*/iq.conf; do
   unit=$(basename "$(dirname "$conf")")
-  if ! grep -q "^shared_preload_libraries = '[^']*pg_search" "$conf"; then
-    sed -i "s/^shared_preload_libraries = '\([^']*\)'/shared_preload_libraries = '\1,pg_search'/" "$conf"
+  cur=$(sed -n "s/^shared_preload_libraries = '\([^']*\)'.*/\1/p" "$conf")
+  want=$(printf '%s\n' "${cur//,/$'\n'}" pg_search | awk 'NF && !seen[$0]++' | paste -sd, -)
+  if [ "$cur" != "$want" ]; then
+    sed -i "s/^shared_preload_libraries = '[^']*'/shared_preload_libraries = '$want'/" "$conf"
     systemctl restart "iq-citus@$unit"
     port=$(awk '/^port/ {print $3}' "$conf")
     for _ in $(seq 30); do sudo -u postgres /usr/pgsql-17/bin/pg_isready -q -p "$port" && break; sleep 1; done

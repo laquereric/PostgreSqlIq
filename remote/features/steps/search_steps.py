@@ -65,6 +65,9 @@ def step_found(context, term):
 
 @then("the datums found are held on every worker")
 def step_every_worker(context):
+    if context.cluster.mode == "server":   # one server holds every datum: there is no spread to see
+        context.measures["datums found, held on"] = "the one server (%d)" % len(context.found)
+        return
     where = {context.cluster.node_of(r[0]) for r in context.found}
     with context.cluster.connect(autocommit=True) as c:
         workers = c.execute("SELECT count(*) FROM citus_get_active_worker_nodes()").fetchone()[0]

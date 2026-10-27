@@ -52,9 +52,18 @@ becomes a **Citus cluster** by this runbook, on the same box. Flipping the switc
 
 ## What is measured, and what is not yet
 
-The server shape is measured on PostgreSQL 17.9 (pgembed, loopback): `ACID-server.md`, `GATE-server.md`,
-`INFERENCE-server.md`, `SEARCH-server.md`, `SHACL-server.md`, `TRGM-server.md` and `SHAPE-server.md`. Every scenario
-that does not need Citus or the host passes: one datum as one transaction, the competency questions, inference in
-the transaction, no lost update, the gate as the only writer, SHACL at commit, and BM25 and trigram search. The
-GherkinIq data plane's 38 scenarios (`-D graph=citus`) pass against it too. The migration itself, and a server
-shape on Vultr, have not been run.
+The server shape is **up on Vultr** since 2026-10-27: `iq-pg`, a vc2-2c-4gb in ewr ($20 a month), PostgreSQL
+17.11, pgvector 0.8.7, pg_trgm 1.6 and pg_search 0.26.2, with Citus 14.2 installed and not loaded. Against it, 35
+scenarios pass (`*-server.md`):
+
+- one datum as one transaction;
+- the eight competency questions;
+- inference inside the transaction;
+- no lost update;
+- the gate as the only writer;
+- SHACL at commit;
+- BM25 search ranked by mentions.
+
+The scenarios that need Citus, and the backups (no pgBackRest yet: `backup-up`), are skipped and named. Earlier, on
+PostgreSQL 17.9 on loopback, GherkinIq's data plane passed all 38 of its scenarios (`-D graph=citus`). The
+migration itself has not been run.

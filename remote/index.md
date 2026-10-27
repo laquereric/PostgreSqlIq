@@ -28,8 +28,9 @@ that is up holds the record, so the switch refuses to move away from it. A serve
 
 A topology may also name a server by `dsn` (no tunnel, no ssh), for a throwaway Postgres in tests. The scenarios
 tagged `@citus` (placement, two-phase commit, crashes, scale-out, `domains`) are skipped on a server, and those
-tagged `@host` (backups) are skipped on a server reached by DSN. Each skip is named in the report. On PostgreSQL
-17.9 the server shape passes every other scenario (`*-server.md`).
+tagged `@host` (backups) are skipped on a server reached by DSN. Each skip is named in the report. **Up on Vultr
+since 2026-10-27** as `iq-pg` (PostgreSQL 17.11, pgvector, pg_trgm, pg_search): 35 scenarios pass (`*-server.md`).
+`search-up` preloads pg_search alone on a server; with Citus, pg_search goes after it.
 
 ## The design
 
