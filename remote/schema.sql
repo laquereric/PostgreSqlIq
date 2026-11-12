@@ -16,6 +16,9 @@
 --   iq.vocab  (s, p, o)      reference table: the T-Box (subClassOf, domain, ..., owl:*Property types)
 --   iq.entail()              the closure under iq-rdfs-plus.rules (UC_DataPlatform/inference), stated and inferred
 --   iq.entail(seeds)         the same, for what is connected to the seeds only (slice 4)
+--   iq.rule   (name)         reference table: rules held as data, Horn rules over triple patterns (iq.put_rule), applied
+--                            in the closure with the vocabulary's own; owl:propertyChainAxiom of two or three properties
+--                            (iq.put_chain) is applied there too (docs/architecture/ONTOLOGY_ENGINEERING.md slice 7)
 
 CREATE SCHEMA IF NOT EXISTS iq;
 
@@ -41,6 +44,13 @@ CREATE TABLE IF NOT EXISTS iq.vocab (
     o text NOT NULL,
     PRIMARY KEY (s, p, o)
 );
+-- A rule as data: body and head each a list of triple patterns [s, p, o], a term a ?variable, an IRI, or (as an
+-- object only) a "quoted literal". Put by iq.put_rule, which refuses one that is not safe or not connected.
+CREATE TABLE IF NOT EXISTS iq.rule (
+    name text PRIMARY KEY,
+    body jsonb NOT NULL,
+    head jsonb NOT NULL
+);
 
 -- The store's shape (deploy-citus.sh shape): on a single server (`server`, no Citus) the tables stay local and only
 -- the foreign key is added; on a Citus cluster (`citus`) they are distributed first. A server made a cluster later
@@ -63,7 +73,151 @@ BEGIN
         ALTER TABLE iq.quad ADD CONSTRAINT quad_of_datum FOREIGN KEY (g) REFERENCES iq.datum (iri)
             ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
     END IF;
+    IF to_regclass('pg_catalog.pg_dist_partition') IS NOT NULL THEN       -- nested: a server has no pg_dist_partition
+        IF NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = 'iq.rule'::regclass) THEN
+            PERFORM create_reference_table('iq.rule');      -- a copy on every node, as the vocabulary is
+        END IF;
+    END IF;
 END $$;
+
+-- A rule's checks, as iq.put_rule makes them: every atom three terms, a literal only as an object; SAFE (every variable
+-- of the head bound by the body); CONNECTED (the body's atoms joined through shared variables, so the scoped closure,
+-- which follows nodes, sees all a rule can use). Raises 'bad_rule', 'unsafe_rule', 'disconnected_rule'.
+CREATE OR REPLACE FUNCTION iq.check_rule(body jsonb, head jsonb) RETURNS void
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+    atom jsonb; t text; j int; i int; k int; vars text[] := '{}'; mine text[]; groups text[][] := '{}';
+    seen int[] := '{}'; changed boolean;
+BEGIN
+    IF jsonb_typeof(body) <> 'array' OR jsonb_typeof(head) <> 'array' OR jsonb_array_length(body) = 0
+       OR jsonb_array_length(head) = 0 THEN
+        RAISE EXCEPTION 'bad_rule: a body and a head, each a list of [s, p, o]';
+    END IF;
+    FOR atom IN SELECT * FROM jsonb_array_elements(body || head) LOOP
+        IF jsonb_typeof(atom) <> 'array' OR jsonb_array_length(atom) <> 3 THEN
+            RAISE EXCEPTION 'bad_rule: % is not [s, p, o]', atom;
+        END IF;
+        FOR j IN 0 .. 2 LOOP
+            t := atom ->> j;
+            IF t IS NULL OR t = '' OR (left(t, 1) = '"' AND (j < 2 OR length(t) < 2 OR right(t, 1) <> '"')) THEN
+                RAISE EXCEPTION 'bad_rule: % (a literal is an object, "quoted")', atom;
+            END IF;
+        END LOOP;
+    END LOOP;
+    FOR atom IN SELECT * FROM jsonb_array_elements(body) LOOP
+        vars := vars || ARRAY(SELECT x FROM jsonb_array_elements_text(atom) x WHERE left(x, 1) = '?');
+    END LOOP;
+    FOR atom IN SELECT * FROM jsonb_array_elements(head) LOOP
+        FOR t IN SELECT x FROM jsonb_array_elements_text(atom) x WHERE left(x, 1) = '?' LOOP
+            IF NOT t = ANY (vars) THEN
+                RAISE EXCEPTION 'unsafe_rule: % is in the head and bound by no atom of the body', t;
+            END IF;
+        END LOOP;
+    END LOOP;
+    -- connected: grow from the first atom through shared variables
+    seen := ARRAY[0];
+    mine := ARRAY(SELECT x FROM jsonb_array_elements_text(body -> 0) x WHERE left(x, 1) = '?');
+    LOOP
+        changed := false;
+        FOR i IN 1 .. jsonb_array_length(body) - 1 LOOP
+            CONTINUE WHEN i = ANY (seen);
+            IF EXISTS (SELECT 1 FROM jsonb_array_elements_text(body -> i) x WHERE x = ANY (mine)) THEN
+                seen := seen || i;
+                mine := mine || ARRAY(SELECT x FROM jsonb_array_elements_text(body -> i) x WHERE left(x, 1) = '?');
+                changed := true;
+            END IF;
+        END LOOP;
+        EXIT WHEN NOT changed;
+    END LOOP;
+    IF cardinality(seen) < jsonb_array_length(body) THEN
+        RAISE EXCEPTION 'disconnected_rule: the body''s atoms share no variable with the rest';
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION iq.put_rule(name text, body jsonb, head jsonb) RETURNS void
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM iq.check_rule(body, head);
+    INSERT INTO iq.rule VALUES (name, body, head) ON CONFLICT ON CONSTRAINT rule_pkey
+        DO UPDATE SET body = EXCLUDED.body, head = EXCLUDED.head;
+END
+$fn$;
+
+-- owl:propertyChainAxiom as OWL writes it (`p owl:propertyChainAxiom (p1 p2 ...)`), into the vocabulary; a chain of
+-- two or three properties (the closure applies those). Raises 'chain_length'.
+CREATE OR REPLACE FUNCTION iq.put_chain(p text, props text[]) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    first CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#first';
+    rest  CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#rest';
+    nil   CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#nil';
+    id text := '_:chain-' || md5(p || '|' || array_to_string(props, '|'));
+    i int;
+BEGIN
+    IF cardinality(props) NOT IN (2, 3) THEN
+        RAISE EXCEPTION 'chain_length: a chain of two or three properties, not %', cardinality(props);
+    END IF;
+    INSERT INTO iq.vocab VALUES (p, 'http://www.w3.org/2002/07/owl#propertyChainAxiom', id || '-1') ON CONFLICT DO NOTHING;
+    FOR i IN 1 .. cardinality(props) LOOP
+        INSERT INTO iq.vocab VALUES (id || '-' || i, first, props[i]) ON CONFLICT DO NOTHING;
+        INSERT INTO iq.vocab VALUES (id || '-' || i, rest, CASE WHEN i = cardinality(props) THEN nil
+                                                                ELSE id || '-' || (i + 1) END) ON CONFLICT DO NOTHING;
+    END LOOP;
+END
+$fn$;
+
+-- A rule as the statements that apply it once over the working closure (iq_closure): one INSERT ... SELECT per atom of
+-- its head, the body's atoms joined on their shared variables.
+CREATE OR REPLACE FUNCTION iq.rule_sql(body jsonb, head jsonb) RETURNS text[]
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+    cols CONSTANT text[] := ARRAY['s', 'p', 'o'];
+    i int; j int; t text; col text; bound jsonb := '{}'; lit jsonb := '{}'; conds text[] := '{}';
+    froms text[] := '{}'; h jsonb; terms text[]; hlit text; out text[] := '{}';
+BEGIN
+    FOR i IN 0 .. jsonb_array_length(body) - 1 LOOP
+        froms := froms || format('iq_closure b%s', i);
+        FOR j IN 0 .. 2 LOOP
+            t := body -> i ->> j;
+            col := format('b%s.%s', i, cols[j + 1]);
+            IF left(t, 1) = '?' THEN
+                IF bound ? t THEN
+                    conds := conds || format('%s = %s', col, bound ->> t);
+                    IF lit ? t AND j = 2 THEN conds := conds || format('b%s.lit = %s', i, lit ->> t);
+                    ELSIF lit ? t THEN conds := conds || format('NOT %s', lit ->> t);
+                    ELSIF j = 2 THEN conds := conds || format('NOT b%s.lit', i);
+                    END IF;
+                ELSE
+                    bound := bound || jsonb_build_object(t, col);
+                    IF j = 2 THEN lit := lit || jsonb_build_object(t, format('b%s.lit', i)); END IF;
+                END IF;
+            ELSIF left(t, 1) = '"' THEN
+                conds := conds || format('%s = %L AND b%s.lit', col, substr(t, 2, length(t) - 2), i);
+            ELSE
+                conds := conds || format('%s = %L', col, t);
+                IF j = 2 THEN conds := conds || format('NOT b%s.lit', i); END IF;
+            END IF;
+        END LOOP;
+    END LOOP;
+    FOR h IN SELECT * FROM jsonb_array_elements(head) LOOP
+        terms := '{}';
+        FOR j IN 0 .. 2 LOOP
+            t := h ->> j;
+            terms := terms || CASE WHEN left(t, 1) = '?' THEN bound ->> t
+                                   WHEN left(t, 1) = '"' THEN quote_literal(substr(t, 2, length(t) - 2))
+                                   ELSE quote_literal(t) END;
+        END LOOP;
+        t := h ->> 2;
+        hlit := CASE WHEN left(t, 1) = '"' THEN 'true' WHEN left(t, 1) = '?' THEN coalesce(lit ->> t, 'false')
+                     ELSE 'false' END;
+        out := out || format('INSERT INTO iq_closure SELECT DISTINCT %s, %s, %s, %s, true FROM %s WHERE %s ON CONFLICT DO NOTHING',
+                             terms[1], terms[2], terms[3], hlit, array_to_string(froms, ', '),
+                             coalesce(nullif(array_to_string(conds, ' AND '), ''), 'true'));
+    END LOOP;
+    RETURN out;
+END
+$fn$;
 
 -- the data plane's datum (slice 3, GherkinIq/Facet/Store/sparql_citus.py): the exact body as given, its media type,
 -- what it was derived from, when it was recorded; and each quad's named graph ('' = the default graph) and language
@@ -100,11 +254,26 @@ DECLARE
     ifp  CONSTANT text := 'http://www.w3.org/2002/07/owl#InverseFunctionalProperty';
     sym  CONSTANT text := 'http://www.w3.org/2002/07/owl#SymmetricProperty';
     tra  CONSTANT text := 'http://www.w3.org/2002/07/owl#TransitiveProperty';
-    n bigint; added bigint; rounds int := 0;
+    chn  CONSTANT text := 'http://www.w3.org/2002/07/owl#propertyChainAxiom';
+    fst  CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#first';
+    rst  CONSTANT text := 'http://www.w3.org/1999/02/22-rdf-syntax-ns#rest';
+    n bigint; added bigint; rounds int := 0; rules text[]; stmt text;
 BEGIN
     CREATE INDEX ON iq_closure (p, o);
     CREATE INDEX ON iq_closure (o);
     ANALYZE iq_closure;
+    -- the chains the vocabulary holds (a chain of two or three properties; a longer one is not applied)
+    DROP TABLE IF EXISTS pg_temp.iq_chain;
+    CREATE TEMP TABLE iq_chain ON COMMIT DROP AS
+    WITH RECURSIVE lst(chain, p, node, pos, prop) AS (
+        SELECT c.o, c.s, c.o, 1, f.o FROM iq_closure c JOIN iq_closure f ON f.s = c.o AND f.p = fst WHERE c.p = chn
+        UNION ALL
+        SELECT l.chain, l.p, r.o, l.pos + 1, f.o FROM lst l JOIN iq_closure r ON r.s = l.node AND r.p = rst
+          JOIN iq_closure f ON f.s = r.o AND f.p = fst WHERE l.pos < 4)
+    SELECT p, max(prop) FILTER (WHERE pos = 1) AS p1, max(prop) FILTER (WHERE pos = 2) AS p2,
+           max(prop) FILTER (WHERE pos = 3) AS p3, count(*) AS n FROM lst GROUP BY chain, p;
+    -- the rules held as data, each as the statements that apply it once
+    rules := ARRAY(SELECT unnest(iq.rule_sql(r.body, r.head)) FROM iq.rule r ORDER BY r.name);
     LOOP
         added := 0;
         -- rdfs2 domain
@@ -172,6 +341,19 @@ BEGIN
         INSERT INTO iq_closure SELECT v.o, i.o, v.s, false, true FROM iq_closure i JOIN iq_closure v ON v.p = i.s
             WHERE i.p = inv AND NOT v.lit ON CONFLICT DO NOTHING;
         GET DIAGNOSTICS n = ROW_COUNT; added := added + n;
+        -- prp-spo2 owl:propertyChainAxiom, of two properties and of three
+        INSERT INTO iq_closure SELECT x.s, ch.p, y.o, y.lit, true FROM iq_chain ch JOIN iq_closure x ON x.p = ch.p1
+            JOIN iq_closure y ON y.s = x.o AND y.p = ch.p2 WHERE ch.n = 2 AND NOT x.lit ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS n = ROW_COUNT; added := added + n;
+        INSERT INTO iq_closure SELECT x.s, ch.p, z.o, z.lit, true FROM iq_chain ch JOIN iq_closure x ON x.p = ch.p1
+            JOIN iq_closure y ON y.s = x.o AND y.p = ch.p2 JOIN iq_closure z ON z.s = y.o AND z.p = ch.p3
+            WHERE ch.n = 3 AND NOT x.lit AND NOT y.lit ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS n = ROW_COUNT; added := added + n;
+        -- the rules held as data
+        FOREACH stmt IN ARRAY rules LOOP
+            EXECUTE stmt;
+            GET DIAGNOSTICS n = ROW_COUNT; added := added + n;
+        END LOOP;
         rounds := rounds + 1;
         EXIT WHEN added = 0;
     END LOOP;
@@ -296,6 +478,8 @@ BEGIN
 END $$;
 
 GRANT USAGE ON SCHEMA iq TO iq;
-GRANT SELECT, INSERT, UPDATE, DELETE ON iq.datum, iq.quad, iq.vocab TO iq;
+GRANT SELECT, INSERT, UPDATE, DELETE ON iq.datum, iq.quad, iq.vocab, iq.rule TO iq;
 GRANT SELECT, INSERT ON iq.cluster_datum TO iq;
 GRANT EXECUTE ON FUNCTION iq.entail(), iq.entail(text[]), iq.entail_fixpoint(), iq.closure_table() TO iq;
+GRANT EXECUTE ON FUNCTION iq.put_rule(text, jsonb, jsonb), iq.put_chain(text, text[]), iq.check_rule(jsonb, jsonb),
+    iq.rule_sql(jsonb, jsonb) TO iq;

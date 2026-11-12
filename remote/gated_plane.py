@@ -22,7 +22,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-for p in (ROOT / "GherkinIq/Facet/Store", ROOT / "Development/UseCase/UC_MarkLogic/surface"):
+for p in (ROOT / "GherkinIq/Facet/Store", ROOT / "Development/UseCase/UC_MarkLogic/surface",
+          ROOT / "vendor/iq_marklogic/Development/UseCase/UC_MarkLogic/surface"):     # ml_mcp, since UC_MarkLogic split out
     sys.path.insert(0, str(p))
 
 from dataplane import BlobAdapter, Datum, LocalObjects, Plane  # noqa: E402

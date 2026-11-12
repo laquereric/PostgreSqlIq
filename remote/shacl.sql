@@ -203,11 +203,11 @@ DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq_agent') TH
 -- coordinator (deploy-citus.sh gate-up). An agent reads, and writes nothing -- not even through put_datum.
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iq_gate') THEN CREATE ROLE iq_gate NOLOGIN; END IF; END $$;
 GRANT USAGE ON SCHEMA iq TO iq_gate;
-GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_gate;
+GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.rule, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_gate;
 GRANT SELECT, INSERT, DELETE ON iq.shacl_pending TO iq_gate;
 GRANT iq_agent TO iq;
 GRANT USAGE ON SCHEMA iq TO iq_agent;
-GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_agent;
+GRANT SELECT ON iq.datum, iq.quad, iq.vocab, iq.rule, iq.shape_target, iq.shape_property, iq.shape_closed TO iq_agent;
 GRANT SELECT, INSERT, UPDATE, DELETE ON iq.shape_target, iq.shape_property, iq.shape_closed TO iq;
 REVOKE ALL ON iq.shacl_pending FROM iq_agent;
 GRANT SELECT, INSERT, DELETE ON iq.shacl_pending TO iq;
